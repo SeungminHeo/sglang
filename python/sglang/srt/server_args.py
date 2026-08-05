@@ -4363,6 +4363,14 @@ class ServerArgs:
 
             apply_deepseek_v4_defaults(self, model_arch)
 
+        if model_arch == "AXK2ForCausalLM" and self.enable_two_batch_overlap:
+            raise ValueError(
+                "--enable-two-batch-overlap is not supported for A.X-K2: the "
+                "attention output gate is handed from the fused q/gate "
+                "projection to o_proj within one attention forward, and the "
+                "TBO op schedule interleaves prepare/core across micro-batches."
+            )
+
         if model_arch in [
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
@@ -4371,6 +4379,7 @@ class ServerArgs:
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
             "LongcatFlashForCausalLM",
+            "AXK2ForCausalLM",
         ]:
             # Set attention backend for DeepSeek
             if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5

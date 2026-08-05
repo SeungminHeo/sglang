@@ -329,6 +329,7 @@ def _register_for(*architectures: str):
     "GlmMoeDsaForCausalLM",
     "LongcatFlashForCausalLM",
     "LongcatFlashForCausalLMNextN",
+    "AXK2ForCausalLM",
 )
 def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     """Order-safe declarations of the DeepSeek/DSA branch. The CP parallel
@@ -1324,6 +1325,7 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "GlmMoeDsaForCausalLM",
         "LongcatFlashForCausalLM",
         "LongcatFlashForCausalLMNextN",
+        "AXK2ForCausalLM",
     }
 )
 
