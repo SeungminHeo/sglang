@@ -1,6 +1,6 @@
 """Config-time override declarations for deepseek_v2.
 
-Architectures: DeepseekV32ForCausalLM, DeepseekV3ForCausalLM, Dots3NoteForCausalLM, Glm5NextForConditionalGeneration, GlmMoeDsaForCausalLM, HYV4ForCausalLM, HYV4ForCausalLMNextN, KimiK25ForConditionalGeneration, LongcatFlashForCausalLM, LongcatFlashForCausalLMNextN, MistralLarge3ForCausalLM, PixtralForConditionalGeneration.
+Architectures: AXK2ForCausalLM, DeepseekV32ForCausalLM, DeepseekV3ForCausalLM, Dots3NoteForCausalLM, Glm5NextForConditionalGeneration, GlmMoeDsaForCausalLM, HYV4ForCausalLM, HYV4ForCausalLMNextN, KimiK25ForConditionalGeneration, LongcatFlashForCausalLM, LongcatFlashForCausalLMNextN, MistralLarge3ForCausalLM, PixtralForConditionalGeneration.
 """
 
 import logging
@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
     "LongcatFlashForCausalLM",
     "LongcatFlashForCausalLMNextN",
     "Dots3NoteForCausalLM",
+    "AXK2ForCausalLM",
 )
 def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     """Order-safe declarations of the DeepSeek/DSA branch. The CP parallel
@@ -60,6 +61,15 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 "provide single-owner semantics for learnable attention sinks. "
                 f"Got architecture={model_arch!r} and dcp_size={dcp_size!r}."
             )
+
+    model_arch = (getattr(hf_config, "architectures", None) or [None])[0]
+    if model_arch == "AXK2ForCausalLM" and cfg.enable_two_batch_overlap:
+        raise ValueError(
+            "--enable-two-batch-overlap is not supported for A.X-K2: the "
+            "attention output gate is handed from the fused q/gate "
+            "projection to o_proj within one attention forward, and the "
+            "TBO op schedule interleaves prepare/core across micro-batches."
+        )
 
     overrides: Dict[str, Any] = {}
 
