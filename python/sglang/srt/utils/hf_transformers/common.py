@@ -223,6 +223,15 @@ try:
         model_type = "kimi_k2"
 
     _CONFIG_REGISTRY["kimi_k2"] = _KimiK2ConfigAlias
+
+    # SKT A.X-K2 is a DeepSeek-V3.2 derivative; the alias keeps the config
+    # json-faithful (native transformers AXK2Config replaces
+    # first_k_dense_replace/moe_layer_freq with mlp_layer_types, which the
+    # DeepSeek model code does not read).
+    class _AXK2ConfigAlias(_HFDeepseekV3Config):
+        model_type = "axk2"
+
+    _CONFIG_REGISTRY["axk2"] = _AXK2ConfigAlias
 except ImportError:
     pass
 

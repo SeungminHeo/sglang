@@ -1,6 +1,6 @@
 """Config-time override declarations for deepseek_v2.
 
-Architectures: DeepseekV32ForCausalLM, DeepseekV3ForCausalLM, Dots3NoteForCausalLM, Glm5NextForConditionalGeneration, GlmMoeDsaForCausalLM, HYV4ForCausalLM, HYV4ForCausalLMNextN, KimiK25ForConditionalGeneration, LongcatFlashForCausalLM, LongcatFlashForCausalLMNextN, MistralLarge3ForCausalLM, PixtralForConditionalGeneration.
+Architectures: AXK2ForCausalLM, DeepseekV32ForCausalLM, DeepseekV3ForCausalLM, Dots3NoteForCausalLM, Glm5NextForConditionalGeneration, GlmMoeDsaForCausalLM, HYV4ForCausalLM, HYV4ForCausalLMNextN, KimiK25ForConditionalGeneration, LongcatFlashForCausalLM, LongcatFlashForCausalLMNextN, MistralLarge3ForCausalLM, PixtralForConditionalGeneration.
 """
 
 import logging
@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
     "LongcatFlashForCausalLM",
     "LongcatFlashForCausalLMNextN",
     "Dots3NoteForCausalLM",
+    "AXK2ForCausalLM",
 )
 def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     """Order-safe declarations of the DeepSeek/DSA branch. The CP parallel
