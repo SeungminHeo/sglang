@@ -44,7 +44,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+from sglang.kernels.ops.layernorm.elementwise import fused_sigmoid_mul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -216,7 +216,6 @@ class _AXK2GatedOProj(RowParallelLinear):
         input_,
         skip_all_reduce=False,
         forward_batch=None,
-        output_tensor=None,
     ):
         gate = self._take_gate()
         assert torch.is_tensor(input_) and input_.dim() == 2, (
@@ -233,7 +232,6 @@ class _AXK2GatedOProj(RowParallelLinear):
             input_,
             skip_all_reduce=skip_all_reduce,
             forward_batch=forward_batch,
-            output_tensor=output_tensor,
         )
 
 
