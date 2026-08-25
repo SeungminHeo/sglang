@@ -188,6 +188,63 @@ class TestSpecTopk1Triton(CustomTestCase):
             positions, torch.ones_like(positions), rtol=0, atol=0
         )
 
+    def test_nan_logits_yield_in_range_index(self):
+        # Regression: a broken draft (e.g. a corrupted checkpoint) emits NaN
+        # logits. Triton's argmax combine compares with `>`, which is always
+        # False for NaN, so a NaN-bearing row could otherwise settle on a
+        # masked lane: an index >= vocab_size out of the partial kernel, or an
+        # out-of-row `partial_indices` read in the finalize kernel. The garbage
+        # token id then indexes target_probs in the verify kernel (CUDA illegal
+        # memory access), or reaches generate_token_bitmask's DFS as a negative
+        # index into the grammar bitmask (IndexError, structured output only).
+        # The kernel maps NaN to a large finite negative, so a NaN lane loses
+        # to any real logit and an all-NaN row still resolves in range.
+        configs = [
+            # 20 full splits; 12 masked lanes in the finalize reduction.
+            (163840, torch.float32),
+            # Partially masked second split in the partial kernel.
+            (8193, torch.float16),
+            # Single split.
+            (4096, torch.bfloat16),
+        ]
+        nan = float("nan")
+        for vocab_size, dtype in configs:
+            with self.subTest(vocab_size=vocab_size, dtype=dtype):
+                batch_size = 5
+                logits, expected_index = _make_logits_with_unique_argmax(
+                    batch_size,
+                    vocab_size,
+                    dtype=dtype,
+                    device=self.device,
+                    seed=vocab_size + 1,
+                )
+                logits[1, ::7] = nan  # spread across splits
+                logits[2, : vocab_size // 2] = nan  # whole leading splits
+                logits[3, -1] = nan  # last lane, next to the masked tail
+                logits[4, :] = nan  # every lane but the spike restored below
+                # Rows 1-4 keep exactly one finite lane that must win.
+                logits.scatter_(1, expected_index, 1000.0)
+                # Row 0 has no finite lane at all: only the index range is
+                # defined, and that is the property the crash depends on.
+                logits[0] = nan
+                positions = torch.zeros(
+                    batch_size, dtype=torch.long, device=self.device
+                )
+
+                topk_p, topk_index = draft_topk1_postprocess(logits, positions)
+
+                self.assertTrue(bool((topk_index >= 0).all()))
+                self.assertTrue(bool((topk_index < vocab_size).all()))
+                torch.testing.assert_close(
+                    topk_index[1:], expected_index[1:], rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    topk_p, torch.ones_like(topk_p), rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    positions, torch.ones_like(positions), rtol=0, atol=0
+                )
+
     def test_empty_batch(self):
         logits = torch.empty((0, 1024), dtype=torch.float32, device=self.device)
         positions = torch.empty((0,), dtype=torch.long, device=self.device)

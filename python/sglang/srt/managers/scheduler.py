@@ -44,6 +44,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_serving,
     get_spec,
+    max_speculative_num_draft_tokens,
     publish,
     spawn_world_rank,
 )
@@ -2536,11 +2537,23 @@ class Scheduler(
             max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
 
         # Keep this bound consistent with PrefillAdder's admission budget.
+        # Speculative decoding drafts and verifies up to
+        # `speculative_num_draft_tokens` positions past the committed sequence
+        # within one round, so the per-request length budget must leave that
+        # many slots below max_req_len. Without this headroom a request whose
+        # generation runs to the context limit can start a spec round at
+        # seq_len > max_req_len - num_draft_tokens and index KV/position
+        # structures past the context length (observed as a CUDA illegal
+        # memory access at exactly context_len). The tokenizer-side validation
+        # reserves the same headroom via num_reserved_tokens, but requests
+        # without an explicit max_new_tokens bypass that check, so clamp here
+        # as well.
+        num_spec_draft_tokens = max_speculative_num_draft_tokens() or 0
         max_new_tokens = max(
             0,
             min(
                 max_new_tokens,
-                self.max_req_len - input_len - 1,
+                self.max_req_len - input_len - 1 - num_spec_draft_tokens,
             ),
         )
         max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
