@@ -278,6 +278,7 @@ from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
+    compute_num_reserved_tokens,
     is_health_check_generate_req,
     validate_input_length,
 )
@@ -2529,11 +2530,22 @@ class Scheduler(
         # into the waiting queue but can never be scheduled, blocking the queue
         # and eventually making health checks fail.
         paged_input_len = -(-input_len // self.page_size) * self.page_size
+        # A speculative round drafts and verifies past the committed sequence
+        # within one step, so the per-request length budget must leave those
+        # slots below max_req_len. Without the headroom a request whose
+        # generation runs to the context limit can start a round at
+        # seq_len > max_req_len - reserved and index KV/position structures
+        # past the context length (observed as a CUDA illegal memory access at
+        # exactly context_len). `TokenizerManager` reserves the same count for
+        # its total-token check, but requests without an explicit
+        # max_new_tokens bypass that check, so clamp here with the same
+        # helper — the two bounds have to agree.
+        num_reserved_tokens = compute_num_reserved_tokens()
         req.sampling_params.max_new_tokens = max(
             0,
             min(
                 max_new_tokens,
-                self.max_req_len - input_len - 1,
+                self.max_req_len - input_len - 1 - num_reserved_tokens,
                 self.max_total_num_tokens * get_parallel().attn_dcp_size
                 - paged_input_len
                 - self.page_size
