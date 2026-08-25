@@ -44,6 +44,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_serving,
     get_spec,
+    max_speculative_num_draft_tokens,
     publish,
     spawn_world_rank,
 )
@@ -445,6 +446,8 @@ class Scheduler(
 
     # Logical-to-physical KV capacity ratio; defaults to 1 before pool init.
     kv_shard_widening: int = 1
+    # Draft tokens one spec round may hold past the sequence; 0 without spec decoding.
+    max_speculative_num_draft_tokens: int = 0
 
     # Class-level default so on_idle's stall gate works even if a fork
     # overrides init_load_publisher (which would otherwise not set it).
@@ -498,6 +501,7 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
+        self.max_speculative_num_draft_tokens = max_speculative_num_draft_tokens() or 0
         self.page_size = get_schedule().page_size
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
         self.enable_lmcache = get_memory().enable_lmcache
@@ -2529,11 +2533,16 @@ class Scheduler(
             max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
 
         # Keep this bound consistent with PrefillAdder's admission budget.
+        # A spec round indexes KV up to that many draft tokens past the sequence;
+        # the tokenizer-side reserve is skipped when max_new_tokens is unset.
         max_new_tokens = max(
             0,
             min(
                 max_new_tokens,
-                self.max_req_len - input_len - 1,
+                self.max_req_len
+                - input_len
+                - 1
+                - self.max_speculative_num_draft_tokens,
             ),
         )
         # PrefillAdder reserves one page per shard; the allocator reserves one.

@@ -18,7 +18,8 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
     """Property tests for Scheduler.init_req_max_new_tokens.
 
     Rules enforced when clipping a request's max_new_tokens:
-      1. context: input_len + max_new_tokens < max_req_len
+      1. context: input_len + max_new_tokens + max_speculative_num_draft_tokens
+         < max_req_len
       2. admission budget (PrefillAdder):
          ceil_page(input_len) + max_new_tokens + page_size * shard_widening
          < max_total_num_tokens * shard_widening
@@ -54,9 +55,11 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         max_total_num_tokens: int = 1024,
         page_size: int = 1,
         kv_shard_widening: int = 1,
+        max_speculative_num_draft_tokens: int = 0,
     ) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.max_req_len = max_req_len
+        scheduler.max_speculative_num_draft_tokens = max_speculative_num_draft_tokens
         scheduler.max_total_num_tokens = max_total_num_tokens
         scheduler.page_size = page_size
         scheduler.kv_shard_widening = kv_shard_widening
@@ -97,7 +100,10 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         limit_active = limit is not None and limit > 0
 
         def satisfies_rules(candidate: int) -> bool:
-            context_ok = input_len + candidate < scheduler.max_req_len
+            context_ok = (
+                input_len + candidate + scheduler.max_speculative_num_draft_tokens
+                < scheduler.max_req_len
+            )
             budget_ok = (
                 paged_input_len + candidate + page_size * shard_widening
                 < scheduler.max_total_num_tokens * shard_widening
@@ -146,6 +152,21 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             req = self._new_req(max_new_tokens=64, input_len=input_len)
             self.assertEqual(
                 self._init_and_check(scheduler, req), max_req_len - input_len - 1
+            )
+
+    def test_spec_round_stays_below_context_limit(self):
+        """A request left to run to the context limit under speculative decoding
+        must stop one spec round short of it, or the round indexes past context_len."""
+        max_req_len, input_len, num_draft_tokens = 32, 8, 4
+        with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(None):
+            scheduler = self._new_scheduler(
+                max_req_len=max_req_len,
+                max_speculative_num_draft_tokens=num_draft_tokens,
+            )
+            req = self._new_req(max_new_tokens=None, input_len=input_len)
+            self.assertEqual(
+                self._init_and_check(scheduler, req),
+                max_req_len - input_len - 1 - num_draft_tokens,
             )
 
     def test_budget_rule_binds_tighter_than_limit(self):
