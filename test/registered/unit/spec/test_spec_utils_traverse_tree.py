@@ -107,5 +107,60 @@ class TestTraverseTreePassesIntsToGrammar(unittest.TestCase):
         self.assertEqual(fill_calls, [0, 1])
 
 
+class TestTraverseTreeRejectsOutOfRangeDraftTokens(unittest.TestCase):
+    """A draft token outside [0, vocab_size) must be rejected, not indexed with.
+
+    Production hit this with structured output on: the fused top-k=1 draft
+    returned an id read past the end of its `partial_indices` buffer, so
+    `draft_tokens` carried values like -1088176107. The upper-bound check let
+    every negative through, and `parent_bitmask[current_token // 32]` then
+    raised IndexError inside this DFS, taking down all TP ranks.
+    """
+
+    VOCAB = 163840  # A.X-K2
+
+    def _grammar(self):
+        grammar = MagicMock()
+        grammar.is_terminated.return_value = False
+        accept_calls, fill_calls = [], []
+        grammar.accept_token.side_effect = accept_calls.append
+        grammar.fill_vocab_mask.side_effect = lambda _b, idx: fill_calls.append(idx)
+        grammar.rollback.return_value = None
+        return grammar, accept_calls, fill_calls
+
+    def _run(self, bad_token):
+        # chain 0 -- 1 -- 2 -- 3, with the bad id at node 2
+        rnt = torch.tensor([1, 2, 3, -1], dtype=torch.int32)
+        rns = torch.tensor([-1, -1, -1, -1], dtype=torch.int32)
+        draft_tokens = torch.tensor([100, 11, bad_token, 33], dtype=torch.int64)
+        bitmask = torch.full((4, self.VOCAB // 32), -1, dtype=torch.int32)
+        grammar, accept_calls, fill_calls = self._grammar()
+        traverse_tree(rnt, rns, draft_tokens, grammar, bitmask, vocab_size=self.VOCAB)
+        return accept_calls, fill_calls
+
+    def test_large_negative_token_is_rejected(self):
+        accept_calls, fill_calls = self._run(-1088176107)
+        # node 2 rejected -> it and node 3 are skipped, prefix stays usable
+        self.assertEqual(accept_calls, [11])
+        self.assertEqual(fill_calls, [0, 1])
+
+    def test_minus_one_sentinel_is_rejected(self):
+        # -1 is the sentinel these tree tensors use elsewhere; as a token id it
+        # would silently index the last bitmask word instead of raising.
+        accept_calls, fill_calls = self._run(-1)
+        self.assertEqual(accept_calls, [11])
+        self.assertEqual(fill_calls, [0, 1])
+
+    def test_token_at_or_above_vocab_size_is_rejected(self):
+        accept_calls, fill_calls = self._run(self.VOCAB)
+        self.assertEqual(accept_calls, [11])
+        self.assertEqual(fill_calls, [0, 1])
+
+    def test_in_range_token_still_accepted(self):
+        accept_calls, fill_calls = self._run(self.VOCAB - 1)
+        self.assertEqual(accept_calls, [11, self.VOCAB - 1, 33])
+        self.assertEqual(fill_calls, [0, 1, 2, 3])
+
+
 if __name__ == "__main__":
     unittest.main()
