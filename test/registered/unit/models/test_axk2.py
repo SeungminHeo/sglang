@@ -157,7 +157,51 @@ class TestAXK2ConcatQANorm(CustomTestCase):
         torch.testing.assert_close(out[:, 8:], x)
 
 
+_TP_INITIALIZED = False
+
+
+def _ensure_single_rank_tp() -> None:
+    """Bring up a 1-rank tensor-parallel group on gloo.
+
+    ``RowParallelLinear.forward`` opens ``use_symmetric_memory(get_tp_group())``
+    before it ever looks at ``tp_size``, so even a tp_size=1 layer needs the
+    group; without it the call asserts "tensor model parallel group is not
+    initialized". gloo keeps this file in the CPU suite.
+    """
+    global _TP_INITIALIZED
+    if _TP_INITIALIZED:
+        return
+
+    import os
+    import socket
+
+    from sglang.srt.distributed.parallel_state import (
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+
+    os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+
+    init_distributed_environment(
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        distributed_init_method=f"tcp://127.0.0.1:{port}",
+        backend="gloo",
+    )
+    initialize_model_parallel(tensor_model_parallel_size=1, backend="gloo")
+    _TP_INITIALIZED = True
+
+
 class TestAXK2FusedQGateProj(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        _ensure_single_rank_tp()
+
     def _make_pair(self):
         torch.manual_seed(0)
         proj = _AXK2FusedQGateProj(
