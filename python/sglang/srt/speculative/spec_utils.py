@@ -467,7 +467,13 @@ def traverse_tree(
         else:
             parent_bitmask = allocate_token_bitmask[parent_pos]
             current_token = draft_tokens[curr]
-            if vocab_size and current_token >= vocab_size:
+            # A draft token outside [0, vocab_size) cannot satisfy the grammar.
+            # The upper bound alone is not enough: a negative id indexes
+            # parent_bitmask from the end instead of raising, and a large
+            # negative one raises IndexError deep in this DFS. Both have been
+            # seen in production when the draft handed back an id read out of
+            # an uninitialized buffer.
+            if current_token < 0 or (vocab_size and current_token >= vocab_size):
                 is_accepted = False
             else:
                 # 32 boolean bitmask values are packed into 32-bit integers
