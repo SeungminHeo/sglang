@@ -45,9 +45,12 @@ class DsaGraphVariants:
 
 def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariants]:
     from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
-    from sglang.srt.utils import is_hip
+    from sglang.srt.utils import is_cuda, is_hip
 
-    if is_hip() and is_deepseek_dsa(hf_config):
+    # CUDA: the k-only decode path is the same code the graph prefill split-op
+    # already runs on CUDA (Indexer._forward_cuda_k_only); the dense variant
+    # skips fp8_mqa_logits + top-k for contexts <= index_topk.
+    if (is_hip() or is_cuda()) and is_deepseek_dsa(hf_config):
         index_topk = get_dsa_index_topk(hf_config)
         logger.info(
             "[dense-decode] DSA dual-graph enabled: capturing "

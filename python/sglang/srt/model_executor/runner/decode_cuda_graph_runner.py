@@ -302,11 +302,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
 
+        # DSA dense/sparse variants only differ for plain DECODE batches
+        # (Indexer._should_skip_logits_computation); TARGET_VERIFY / DLLM
+        # captures would just be duplicated.
         self.attention_graph_variants: Optional[AttentionGraphVariants] = (
             create_attention_graph_variants(model_runner.model_config.hf_config)
-            or create_dsv41_candidate_graph_variants(
-                model_runner, self.capture_forward_mode, self.captured_req_width
-            )
+            if self.capture_forward_mode == ForwardMode.DECODE
+            else None
+        ) or create_dsv41_candidate_graph_variants(
+            model_runner, self.capture_forward_mode, self.captured_req_width
         )
 
         # --- bucket sizes ---------------------------------------------
