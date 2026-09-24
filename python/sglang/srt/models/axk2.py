@@ -45,6 +45,10 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+from sglang.kernels.ops.layernorm.lowrank_gated_rmsnorm import (
+    LOWRANK_GATED_RMSNORM_MAX_TOKENS,
+    lowrank_gated_rmsnorm,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -114,6 +118,29 @@ class AXK2GatedRMSNorm(nn.Module):
             return fused_sigmoid_mul(y, gate, inplace=True)
         return (y * torch.sigmoid(gate.float())).to(y.dtype)
 
+    def _fused_small_batch(self, x: torch.Tensor) -> bool:
+        return (
+            x.is_cuda
+            and x.dim() == 2
+            and 0 < x.shape[0] <= LOWRANK_GATED_RMSNORM_MAX_TOKENS
+            and x.stride(1) == 1
+        )
+
+    def _forward_fused(self, x: torch.Tensor, residual: Optional[torch.Tensor]):
+        # One launch: (x + residual) -> rmsnorm -> low-rank gate -> y * sigmoid.
+        # Same in-place contract as the unfused path: with a residual the
+        # output overwrites x and residual receives x + residual; without one
+        # x is left untouched (the caller keeps it as the residual).
+        return lowrank_gated_rmsnorm(
+            x,
+            self.base_norm.weight,
+            self.W_down.weight,
+            self.W_up.weight,
+            self.base_norm.variance_epsilon,
+            residual=residual,
+            out=x if residual is not None else None,
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -122,7 +149,11 @@ class AXK2GatedRMSNorm(nn.Module):
     ):
         if residual is None:
             assert post_residual_addition is None
+            if self._fused_small_batch(x):
+                return self._forward_fused(x, None)[0]
             return self._apply_gate(self.base_norm(x))
+        if post_residual_addition is None and self._fused_small_batch(x):
+            return self._forward_fused(x, residual)
         y, residual = self.base_norm(x, residual, post_residual_addition)
         return self._apply_gate(y), residual
 
