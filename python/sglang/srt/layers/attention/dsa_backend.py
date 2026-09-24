@@ -1076,9 +1076,19 @@ class DeepseekSparseAttnBackend(
             dsa_index_topk=self.dsa_index_topk,
             index_kpool=self.dsa_index_kpool,
         )
-        dsa_cache_seqlens_int32 = pad_dsa_cache_seqlens(
-            forward_batch, dsa_cache_seqlens_int32
-        )
+        # Eager DP forwards run attention over the DP-padded token count, so the
+        # per-token metadata is padded to match. Inside the breakable/piecewise
+        # prefill CUDA graph the attention break narrows q/topk_indices/out_cache_loc
+        # to global_num_token_non_padded_cpu (radix_attention.py
+        # _unified_attention_with_output_impl), so the metadata must keep the
+        # real row count; padding it here breaks FlashMLA's
+        # num_splits == (num_q_rows + 1) contract ("num_splits must have shape (b+1)").
+        if not (
+            self._is_in_breakable_cuda_graph() or self._is_in_tc_piecewise_cuda_graph()
+        ):
+            dsa_cache_seqlens_int32 = pad_dsa_cache_seqlens(
+                forward_batch, dsa_cache_seqlens_int32
+            )
         dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens_int32)
         dsa_cu_seqlens_q = self.get_device_int32_arange(len(dsa_cu_seqlens_k))
 
