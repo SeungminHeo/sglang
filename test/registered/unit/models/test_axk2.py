@@ -139,14 +139,26 @@ class TestAXK2GatedRMSNorm(CustomTestCase):
         torch.testing.assert_close(res_out, expected_res, rtol=1e-5, atol=1e-5)
         torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
 
-    def test_no_fused_norm_fast_path_attributes(self):
-        # LayerCommunicator falls back to the plain module call only when the
-        # norm exposes neither `forward_with_allreduce_fusion` nor a bare
-        # `weight`; if either appears the gate would be silently skipped.
+    def test_no_bare_norm_attributes(self):
+        # LayerCommunicator's fused-norm fast paths key on a bare `weight` /
+        # `variance_epsilon`; exposing them would let a caller skip the gate.
         norm = self._make_norm()
-        self.assertFalse(hasattr(norm, "forward_with_allreduce_fusion"))
         self.assertFalse(hasattr(norm, "weight"))
         self.assertFalse(hasattr(norm, "variance_epsilon"))
+
+    def test_allreduce_fusion_applies_gate(self):
+        # The fused AR+residual+RMSNorm result must still go through the gate.
+        norm = self._make_norm()
+        x, residual = torch.randn(5, 32), torch.randn(5, 32)
+        expected_out, expected_res = norm(x.clone(), residual.clone())
+        norm.base_norm.forward_with_allreduce_fusion = (
+            lambda x, r, p=None, use_attn_tp_group=True: norm.base_norm.forward_native(
+                x, r, p
+            )
+        )
+        out, res_out = norm.forward_with_allreduce_fusion(x.clone(), residual.clone())
+        torch.testing.assert_close(res_out, expected_res, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(out, expected_out, rtol=1e-5, atol=1e-5)
 
 
 class TestAXK2ConcatQANorm(CustomTestCase):

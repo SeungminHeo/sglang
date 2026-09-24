@@ -72,10 +72,11 @@ class AXK2GatedRMSNorm(nn.Module):
     (rank -> hidden), both kept in bf16 (``modules_to_not_convert``).
 
     Mirrors the RMSNorm call contract used by ``LayerCommunicator``:
-    ``forward(x)`` and ``forward(x, residual[, post_residual_addition])`` with
-    fused residual-add. It deliberately does NOT expose ``weight`` /
-    ``variance_epsilon`` / ``forward_with_allreduce_fusion`` so any fused-norm
-    fast path that would silently skip the gate fails loudly instead.
+    ``forward(x)``, ``forward(x, residual[, post_residual_addition])`` with
+    fused residual-add, and ``forward_with_allreduce_fusion`` (all-reduce +
+    residual + RMSNorm in one kernel, gate applied afterwards). It deliberately
+    does NOT expose ``weight`` / ``variance_epsilon`` so any fused-norm fast
+    path that would silently skip the gate fails loudly instead.
     """
 
     def __init__(
@@ -107,6 +108,10 @@ class AXK2GatedRMSNorm(nn.Module):
             return y
         gate, _ = self.W_down(y)
         gate, _ = self.W_up(F.silu(gate))
+        if y.is_cuda:
+            # y * sigmoid(gate) in fp32, stored in y.dtype: one launch instead
+            # of upcast-copy + sigmoid + mul + downcast-copy.
+            return fused_sigmoid_mul(y, gate, inplace=True)
         return (y * torch.sigmoid(gate.float())).to(y.dtype)
 
     def forward(
@@ -119,6 +124,22 @@ class AXK2GatedRMSNorm(nn.Module):
             assert post_residual_addition is None
             return self._apply_gate(self.base_norm(x))
         y, residual = self.base_norm(x, residual, post_residual_addition)
+        return self._apply_gate(y), residual
+
+    def forward_with_allreduce_fusion(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+        use_attn_tp_group: bool = True,
+    ):
+        """All-reduce + residual + RMSNorm fused (flashinfer/aiter), then the gate."""
+        out = self.base_norm.forward_with_allreduce_fusion(
+            x, residual, post_residual_addition, use_attn_tp_group
+        )
+        if residual is None:
+            return self._apply_gate(out)
+        y, residual = out
         return self._apply_gate(y), residual
 
 
