@@ -356,15 +356,23 @@ class DeepseekV2MLP(nn.Module):
                 x = (x, None, y)
 
             gate_up, _ = self.gate_up_proj(x)
-        # Fast path: fused silu+clamp+fp8_quant+deepgemm when conditions met.
+        # Fast path: fused silu[+clamp]+fp8_quant+deepgemm when conditions met.
         # Only valid when down_proj does NOT need an all-reduce and its weights
-        # are fp8 (uint8 storage with weight_scale_inv).
+        # are fp8 (uint8 storage, or float8_e4m3fn block-128 as loaded by
+        # Fp8LinearMethod) with weight_scale_inv. Replaces act_and_mul +
+        # per_token_group_quant + deepgemm (3 launches) with 2.
         if (
-            self.swiglu_limit is not None
+            _is_cuda
+            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and not self.down_proj.reduce_results
+            and gate_up.shape[0] > 0
             and getattr(self.down_proj, "weight", None) is not None
-            and self.down_proj.weight.dtype == torch.uint8
+            and self.down_proj.weight.dtype in (torch.uint8, torch.float8_e4m3fn)
             and hasattr(self.down_proj, "weight_scale_inv")
+            and (
+                self.swiglu_limit is not None
+                or self.down_proj.weight.dtype == torch.float8_e4m3fn
+            )
         ):
             M, N = gate_up.shape
             down_input_fp8 = gate_up.new_empty((M, N // 2), dtype=torch.float8_e4m3fn)
@@ -384,7 +392,9 @@ class DeepseekV2MLP(nn.Module):
                 quant_group_size=scale_block_size,
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 transposed=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                swiglu_limit=float(self.swiglu_limit),
+                swiglu_limit=(
+                    float(self.swiglu_limit) if self.swiglu_limit is not None else None
+                ),
             )
             down_output = gate_up.new_empty(
                 (M, self.down_proj.output_size), dtype=torch.bfloat16
