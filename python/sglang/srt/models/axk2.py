@@ -418,6 +418,117 @@ def _convert_decoder_layer_to_axk2(
     )
 
 
+def _unify_modelopt_fp8_qkv_a_scales(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """Give ModelOpt per-tensor FP8 ``q_a_proj`` / ``kv_a_proj_with_mqa`` one scale.
+
+    The DeepSeek loader concatenates the two projections into the single
+    ``fused_qkv_a_proj_with_mqa`` param and, for scalar scales, keeps only the
+    ``q_a_proj`` one. A ModelOpt per-tensor FP8 checkpoint (A.X-K2-NVFP4)
+    scales each projection separately, so both weights are requantized to the
+    larger weight scale and both activation scales are replaced by their max
+    (what ``requantize_with_max_scale`` does for shard-loaded fused layers).
+    Block-scaled (``weight_scale_inv``) and BF16 layouts pass through.
+    """
+    projs = ("q_a_proj", "kv_a_proj_with_mqa")
+    pending: dict = {}
+    passthrough: set = set()
+    for name, loaded_weight in weights:
+        parsed = None
+        for proj in projs:
+            marker = f".self_attn.{proj}."
+            if marker in name:
+                layer_prefix, suffix = name.split(marker, 1)
+                parsed = (layer_prefix, proj, suffix)
+                break
+        if parsed is None or parsed[0] in passthrough:
+            yield name, loaded_weight
+            continue
+        layer_prefix, proj, suffix = parsed
+        per_tensor = (
+            suffix == "weight" and loaded_weight.dtype == torch.float8_e4m3fn
+        ) or (suffix in ("weight_scale", "input_scale") and loaded_weight.ndim == 0)
+        if not per_tensor:
+            # Not the ModelOpt per-tensor layout: release this layer unchanged.
+            passthrough.add(layer_prefix)
+            for (held_proj, held_suffix), held in pending.pop(layer_prefix, {}).items():
+                yield f"{layer_prefix}.self_attn.{held_proj}.{held_suffix}", held
+            yield name, loaded_weight
+            continue
+        entry = pending.setdefault(layer_prefix, {})
+        entry[(proj, suffix)] = loaded_weight
+        out = []
+        weight_keys = [(p, s) for p in projs for s in ("weight", "weight_scale")]
+        if all(k in entry for k in weight_keys):
+            max_scale = torch.maximum(
+                entry[(projs[0], "weight_scale")], entry[(projs[1], "weight_scale")]
+            )
+            for p in projs:
+                weight = entry.pop((p, "weight"))
+                scale = entry.pop((p, "weight_scale"))
+                if not torch.equal(scale, max_scale):
+                    weight = (weight.to(torch.float32) * (scale / max_scale)).to(
+                        torch.float8_e4m3fn
+                    )
+                out += [(p, "weight", weight), (p, "weight_scale", max_scale)]
+        input_keys = [(p, "input_scale") for p in projs]
+        if all(k in entry for k in input_keys):
+            max_input = torch.maximum(*(entry.pop(k) for k in input_keys))
+            out += [(p, "input_scale", max_input) for p in projs]
+        if not entry:
+            del pending[layer_prefix]
+        for p, s, tensor in out:
+            yield f"{layer_prefix}.self_attn.{p}.{s}", tensor
+    # Unpaired tensors are handed over as-is so the loader reports them.
+    for layer_prefix, entry in pending.items():
+        for (held_proj, held_suffix), held in entry.items():
+            yield f"{layer_prefix}.self_attn.{held_proj}.{held_suffix}", held
+
+
+def _dequant_modelopt_fp8_indexer_wk(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """Pre-dequantize ModelOpt per-tensor FP8 indexer ``wk`` to BF16.
+
+    The fused DSA indexer loads ``wk`` into the BF16 ``wk_weights_proj`` GEMM
+    and only understands BF16 or block-scaled (``weight_scale_inv``) ``wk``; a
+    scalar ``weight_scale`` and the static ``input_scale`` (no consumer in a
+    BF16 GEMM, so it is dropped) would otherwise be copied in as weight rows.
+    Any other ``wk`` layout passes through untouched.
+    """
+    pending: dict = {}
+    for name, loaded_weight in weights:
+        if ".indexer.wk." not in name:
+            yield name, loaded_weight
+            continue
+        prefix, suffix = name.rsplit(".wk.", 1)
+        if suffix == "input_scale":
+            continue
+        is_fp8_weight = (
+            suffix == "weight" and loaded_weight.dtype == torch.float8_e4m3fn
+        )
+        is_scalar_scale = suffix == "weight_scale" and loaded_weight.ndim == 0
+        if not (is_fp8_weight or is_scalar_scale):
+            for held_suffix, held in pending.pop(prefix, {}).items():
+                yield f"{prefix}.wk.{held_suffix}", held
+            yield name, loaded_weight
+            continue
+        entry = pending.setdefault(prefix, {})
+        entry[suffix] = loaded_weight
+        if "weight" in entry and "weight_scale" in entry:
+            del pending[prefix]
+            yield (
+                f"{prefix}.wk.weight",
+                (entry["weight"].to(torch.float32) * entry["weight_scale"]).to(
+                    torch.bfloat16
+                ),
+            )
+    for prefix, entry in pending.items():
+        for held_suffix, held in entry.items():
+            yield f"{prefix}.wk.{held_suffix}", held
+
+
 class AXK2ForCausalLM(DeepseekV2ForCausalLM):
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         assert config.attention_output_gate and config.gated_norm, (
@@ -449,7 +560,18 @@ class AXK2ForCausalLM(DeepseekV2ForCausalLM):
             )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
-        return super().load_weights(self._remap_axk2_names(weights), is_nextn)
+        weights = _unify_modelopt_fp8_qkv_a_scales(self._remap_axk2_names(weights))
+        if self._indexer_fuses_wk():
+            weights = _dequant_modelopt_fp8_indexer_wk(weights)
+        return super().load_weights(weights, is_nextn)
+
+    def _indexer_fuses_wk(self) -> bool:
+        """Whether ``wk`` loads into the BF16 fused ``wk_weights_proj``; the
+        unfused ``wk`` is a quantized linear that takes the checkpoint as-is."""
+        return any(
+            self.model.layers[layer_id].self_attn.indexer.use_dsa_indexer_fusion
+            for layer_id in range(self.model.start_layer, self.model.end_layer)
+        )
 
     @staticmethod
     def _remap_axk2_names(
