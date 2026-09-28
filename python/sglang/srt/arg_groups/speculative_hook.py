@@ -958,6 +958,58 @@ def _handle_iquest_q1_mtp_draft(server_args: ServerArgs) -> bool:
     return True
 
 
+def _resolve_non_dsa_draft_attention_backend(server_args: ServerArgs) -> None:
+    """Keep a non-DSA draft off the target's ``dsa`` attention backend.
+
+    Without an explicit ``--speculative-draft-attention-backend`` the draft
+    runner inherits the target's backends, and ``dsa`` only accepts DSA models
+    (e.g. it rejects the MLA EAGLE3 head of A.X-K2). NextN/MTP drafts of a DSA
+    target load the target config and keep ``dsa``.
+    """
+    cfg = resolving_view(server_args)
+    if cfg.speculative_draft_attention_backend is not None:
+        return
+    if "dsa" not in attention_backends_of(resolved_view(server_args)):
+        return
+    if cfg.speculative_draft_model_path is None:
+        return
+
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    draft_hf_config = get_config(
+        cfg.speculative_draft_model_path,
+        trust_remote_code=cfg.trust_remote_code,
+        revision=cfg.speculative_draft_model_revision,
+    )
+    if is_deepseek_dsa(draft_hf_config):
+        return
+    platform = get_platform()
+    is_mla_draft = getattr(draft_hf_config, "kv_lora_rank", None) is not None
+    if platform.is_xpu or platform.is_hip:
+        # FlashInfer is CUDA-only.
+        fallback = "triton"
+    elif is_mla_draft and platform.is_sm100:
+        # flashinfer's MLA draft extend runs the ragged MHA path, which fails
+        # on the first prefill (its plan does not match the prompt tokens).
+        fallback = "trtllm_mla"
+    elif is_mla_draft and platform.is_sm90:
+        fallback = "fa3"
+    else:
+        fallback = "flashinfer"
+    logger.warning(
+        "The draft model %s is not a DSA model and cannot use the target's 'dsa' "
+        "attention backend; using speculative_draft_attention_backend=%r.",
+        draft_hf_config.architectures[0],
+        fallback,
+    )
+    declare_resolution(
+        server_args,
+        "_resolve_non_dsa_draft_attention_backend",
+        speculative_draft_attention_backend=fallback,
+    )
+
+
 def _handle_eagle_family(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
@@ -1041,6 +1093,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 logger.warning(
                     "DeepSeek MTP does not require setting speculative_draft_model_path."
                 )
+
+    _resolve_non_dsa_draft_attention_backend(server_args)
 
     _handle_iquest_q1_mtp_draft(server_args)
     if not cfg.speculative_adaptive and cfg.speculative_num_steps is None:
