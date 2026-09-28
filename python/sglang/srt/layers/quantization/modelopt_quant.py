@@ -56,6 +56,7 @@ from sglang.srt.layers.quantization.marlin_utils_fp8 import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
+    _FALLBACK_FUSED_SHARDS,
     convert_to_channelwise,
     is_layer_skipped,
     per_tensor_dequantize,
@@ -971,12 +972,19 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             if candidate in self.quantized_layers:
                 return self.quantized_layers[candidate]["quant_algo"].upper()
 
+        # Fused modules (gate_up_proj, ...) resolve through their checkpoint
+        # shards. Models that declare no mapping for a fused module (e.g.
+        # DeepSeek's dense / shared-expert gate_up_proj) use the same fallback
+        # table as is_layer_skipped.
         proj_name = prefix.rsplit(".", 1)[-1]
-        if self.packed_modules_mapping and proj_name in self.packed_modules_mapping:
+        shard_names = (self.packed_modules_mapping or {}).get(
+            proj_name
+        ) or _FALLBACK_FUSED_SHARDS.get(proj_name)
+        if shard_names:
             algos = set()
             base = prefix.rsplit(".", 1)[0]
             for base_candidate in self._quantized_layer_prefix_candidates(base):
-                for shard_name in self.packed_modules_mapping[proj_name]:
+                for shard_name in shard_names:
                     shard_prefix = f"{base_candidate}.{shard_name}"
                     if shard_prefix in self.quantized_layers:
                         algos.add(

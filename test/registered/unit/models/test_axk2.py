@@ -1,10 +1,11 @@
 """Unit tests for the SKT A.X-K2 (AXK2ForCausalLM) port.
 
 Covers the pieces that can be verified without a GPU: config/arch
-registration, checkpoint weight-name remapping, and the numerics of the
+registration, checkpoint weight-name remapping, the numerics of the
 modules A.X-K2 adds on top of DeepSeek-V3.2 (gated RMSNorm, the concatenated
 q_a_layernorm, the fused query/output-gate projection handshake with o_proj,
-and the indexer wq_b slice).
+and the indexer wq_b slice), and the A.X-K2-NVFP4 (ModelOpt MIXED_PRECISION)
+load path: per-layer quant resolution and the per-tensor FP8 weight rewrites.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -29,6 +30,9 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.configs.model_config import is_deepseek_dsa  # noqa: E402
 from sglang.srt.layers.layernorm import RMSNorm  # noqa: E402
+from sglang.srt.layers.quantization.modelopt_quant import (  # noqa: E402
+    ModelOptMixedPrecisionConfig,
+)
 from sglang.srt.models.axk2 import (  # noqa: E402
     AXK2ForCausalLM,
     AXK2GatedRMSNorm,
@@ -37,6 +41,8 @@ from sglang.srt.models.axk2 import (  # noqa: E402
     _AXK2GatedOProj,
     _AXK2SlicedIndexerWqB,
     _convert_decoder_layer_to_axk2,
+    _dequant_modelopt_fp8_indexer_wk,
+    _unify_modelopt_fp8_qkv_a_scales,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer  # noqa: E402
 from sglang.srt.runtime_context import get_parallel  # noqa: E402
@@ -312,6 +318,180 @@ class TestAXK2SlicedIndexerWqB(CustomTestCase):
         wq_b = _AXK2SlicedIndexerWqB(4, 6, bias=False, quant_config=None, prefix="")
         with self.assertRaises(AssertionError):
             wq_b(torch.randn(3, 4))
+
+
+class TestAXK2Nvfp4QuantResolution(CustomTestCase):
+    """A.X-K2-NVFP4 lists the dense / shared-expert MLP by its checkpoint
+    shards (gate_proj, up_proj); DeepSeek builds a fused gate_up_proj it has
+    no packed mapping for."""
+
+    def setUp(self):
+        fp8 = {"quant_algo": "FP8"}
+        nvfp4 = {"quant_algo": "NVFP4", "group_size": 16}
+        layers = {}
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            layers[f"model.layers.0.mlp.{proj}"] = fp8
+            layers[f"model.layers.1.mlp.shared_experts.{proj}"] = fp8
+            layers[f"model.layers.1.mlp.experts.0.{proj}"] = nvfp4
+        for proj in ("q_a_proj", "kv_a_proj_with_mqa", "indexer.wq_b"):
+            layers[f"model.layers.1.self_attn.{proj}"] = fp8
+        self.config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "kv_cache_quant_algo": None,
+                "exclude_modules": ["lm_head", "*.mlp.gate", "*norm*"],
+                "quantized_layers": layers,
+                "packed_modules_mapping": {
+                    "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"]
+                },
+            }
+        )
+
+    def test_unmapped_gate_up_proj_resolves_through_shards(self):
+        for prefix in (
+            "model.layers.0.mlp.gate_up_proj",
+            "model.layers.1.mlp.shared_experts.gate_up_proj",
+        ):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(self.config.resolve_quant_algo(prefix), "FP8")
+
+    def test_other_modules_keep_their_scheme(self):
+        cases = {
+            "model.layers.0.mlp.down_proj": "FP8",
+            "model.layers.1.self_attn.fused_qkv_a_proj_with_mqa": "FP8",
+            "model.layers.1.self_attn.indexer.wq_b": "FP8",
+            "model.layers.1.mlp.experts": "NVFP4",
+            "model.layers.1.mlp.gate": None,
+        }
+        for prefix, algo in cases.items():
+            with self.subTest(prefix=prefix):
+                self.assertEqual(self.config.resolve_quant_algo(prefix), algo)
+
+    def test_mixed_shards_are_rejected(self):
+        self.config.quantized_layers["model.layers.0.mlp.up_proj"] = {
+            "quant_algo": "NVFP4"
+        }
+        with self.assertRaises(ValueError):
+            self.config.resolve_quant_algo("model.layers.0.mlp.gate_up_proj")
+
+
+def _fp8(values):
+    return torch.tensor(values, dtype=torch.float32).to(torch.float8_e4m3fn)
+
+
+class TestAXK2ModelOptFp8QkvAScales(CustomTestCase):
+    """The DeepSeek loader concatenates q_a_proj and kv_a_proj_with_mqa and keeps
+    only q_a_proj's scalar scales; after the rewrite that must be exact enough
+    for both halves."""
+
+    prefix = "model.layers.3"
+
+    def _stream(self, order):
+        q_w, kv_w = _fp8([[1.0, -2.0], [0.5, 4.0]]), _fp8([[3.0, -1.5]])
+        tensors = {
+            ("q_a_proj", "weight"): q_w,
+            ("q_a_proj", "weight_scale"): torch.tensor(0.5),
+            ("q_a_proj", "input_scale"): torch.tensor(0.25),
+            ("kv_a_proj_with_mqa", "weight"): kv_w,
+            ("kv_a_proj_with_mqa", "weight_scale"): torch.tensor(2.0),
+            ("kv_a_proj_with_mqa", "input_scale"): torch.tensor(0.75),
+        }
+        keys = sorted(tensors, reverse=order == "reversed")
+        stream = [
+            (f"{self.prefix}.self_attn.{p}.{s}", tensors[(p, s)]) for p, s in keys
+        ]
+        other = (f"{self.prefix}.self_attn.q_b_proj.weight", torch.zeros(2, 2))
+        return [other] + stream, q_w, kv_w, other
+
+    def test_rewrites_to_one_scale_in_any_order(self):
+        for order in ("sorted", "reversed"):
+            with self.subTest(order=order):
+                stream, q_w, kv_w, other = self._stream(order)
+                out = list(_unify_modelopt_fp8_qkv_a_scales(stream))
+                self.assertEqual(len(out), len(stream))
+                self.assertIs(dict(out)[other[0]], other[1])
+                got = {tuple(n.rsplit(".", 2)[-2:]): t for n, t in out if n != other[0]}
+                for key in ("weight_scale", "input_scale"):
+                    self.assertEqual(
+                        got[("q_a_proj", key)], got[("kv_a_proj_with_mqa", key)]
+                    )
+                self.assertEqual(got[("q_a_proj", "weight_scale")].item(), 2.0)
+                self.assertEqual(got[("q_a_proj", "input_scale")].item(), 0.75)
+                # What the fused loader builds: cat(weights) * q_a_proj's scale.
+                fused = (
+                    torch.cat(
+                        [
+                            got[("q_a_proj", "weight")],
+                            got[("kv_a_proj_with_mqa", "weight")],
+                        ]
+                    ).float()
+                    * got[("q_a_proj", "weight_scale")]
+                )
+                expected = torch.cat([q_w.float() * 0.5, kv_w.float() * 2.0])
+                torch.testing.assert_close(fused, expected)
+
+    def test_block_scaled_and_bf16_layers_pass_through(self):
+        stream = [
+            ("model.layers.3.self_attn.q_a_proj.weight", _fp8([[1.0]])),
+            ("model.layers.3.self_attn.q_a_proj.weight_scale_inv", torch.ones(1, 1)),
+            ("model.layers.3.self_attn.kv_a_proj_with_mqa.weight", _fp8([[2.0]])),
+            (
+                "model.layers.3.self_attn.kv_a_proj_with_mqa.weight_scale_inv",
+                torch.ones(1, 1),
+            ),
+            ("model.layers.4.self_attn.q_a_proj.weight", torch.ones(1, 1)),
+            ("model.layers.4.self_attn.kv_a_proj_with_mqa.weight", torch.ones(1, 1)),
+        ]
+        out = dict(_unify_modelopt_fp8_qkv_a_scales(stream))
+        self.assertEqual(sorted(out), sorted(name for name, _ in stream))
+        for name, tensor in stream:
+            self.assertIs(out[name], tensor)
+
+
+class TestAXK2ModelOptFp8IndexerWk(CustomTestCase):
+    prefix = "model.layers.3.self_attn.indexer"
+
+    def test_per_tensor_wk_becomes_bf16_in_any_order(self):
+        weight, scale = _fp8([[1.0, -2.0], [0.5, 3.0]]), torch.tensor(0.125)
+        for scale_first in (False, True):
+            with self.subTest(scale_first=scale_first):
+                pair = [
+                    (f"{self.prefix}.wk.weight", weight),
+                    (f"{self.prefix}.wk.weight_scale", scale),
+                ]
+                if scale_first:
+                    pair.reverse()
+                stream = [
+                    (f"{self.prefix}.wq_b.weight", torch.zeros(2, 2)),
+                    (f"{self.prefix}.wk.input_scale", torch.tensor(1.0)),
+                    *pair,
+                    (f"{self.prefix}.weights_proj.weight", torch.zeros(4, 2)),
+                ]
+                out = list(_dequant_modelopt_fp8_indexer_wk(stream))
+                self.assertEqual(
+                    [name for name, _ in out],
+                    [
+                        f"{self.prefix}.wq_b.weight",
+                        f"{self.prefix}.wk.weight",
+                        f"{self.prefix}.weights_proj.weight",
+                    ],
+                )
+                wk = dict(out)[f"{self.prefix}.wk.weight"]
+                self.assertEqual(wk.dtype, torch.bfloat16)
+                torch.testing.assert_close(
+                    wk, (weight.float() * scale).to(torch.bfloat16)
+                )
+
+    def test_block_scaled_and_bf16_wk_pass_through(self):
+        stream = [
+            (f"{self.prefix}.wk.weight", _fp8([[1.0]])),
+            (f"{self.prefix}.wk.weight_scale_inv", torch.ones(1, 1)),
+            ("model.layers.4.self_attn.indexer.wk.weight", torch.zeros(2, 2)),
+        ]
+        out = dict(_dequant_modelopt_fp8_indexer_wk(stream))
+        self.assertEqual(sorted(out), sorted(name for name, _ in stream))
+        for name, tensor in stream:
+            self.assertIs(out[name], tensor)
 
 
 if __name__ == "__main__":
