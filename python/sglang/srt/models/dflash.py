@@ -273,6 +273,8 @@ class DFlashAttention(nn.Module):
             and hasattr(rotary, "cos_sin_cache")
             and getattr(rotary, "rotary_dim", None) == head_dim
             and getattr(rotary, "is_neox_style", False)
+            # The Triton kernel spans head_dim with tl.arange, which needs a power of 2.
+            and head_dim & (head_dim - 1) == 0
         )
         self.sliding_window_size, self.attn_type = _get_dflash_layer_attention_params(
             config, layer_id

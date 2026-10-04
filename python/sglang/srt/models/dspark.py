@@ -501,6 +501,21 @@ class DSparkDraftMixin:
             self.markov_head = build_markov_head(config)
         self.confidence_head = build_confidence_head(config)
         self.lm_head: Optional[nn.Module] = None
+        # A reduced-vocab draft ships its own head over a subset of the target
+        # vocab; hot_token_id maps each of its rows to a target token id.
+        self.hot_lm_head: Optional[nn.Linear] = None
+        draft_vocab_size = getattr(config, "draft_vocab_size", None)
+        if draft_vocab_size is not None and int(draft_vocab_size) < int(
+            config.vocab_size
+        ):
+            self.hot_lm_head = nn.Linear(
+                int(config.hidden_size), int(draft_vocab_size), bias=False
+            )
+            self.register_buffer(
+                "hot_token_id",
+                torch.zeros(int(draft_vocab_size), dtype=torch.long),
+                persistent=False,
+            )
         # Expose the draft's own layer count so the draft ModelRunner sizes the
         # draft KV pool correctly. Some DSpark draft checkpoints inherit the
         # target's ``num_nextn_predict_layers`` (>0) on the config; without this
@@ -543,17 +558,36 @@ class DSparkDraftMixin:
             )
         if self.logits_mup_width_multiplier:
             hidden = hidden / self.logits_mup_width_multiplier
+        if self.hot_lm_head is not None:
+            return self._compute_hot_base_logits(hidden), None
         local_logits = project_through_lm_head(hidden, self.lm_head)
         base_logits = gather_and_crop_vocab(local_logits, self.lm_head)
         return base_logits, None
+
+    def _compute_hot_base_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Project through the draft's own head and spread the result over the
+        target vocab, so the Markov head and verify stay in target token ids."""
+        hot_logits = self.hot_lm_head(hidden.to(self.hot_lm_head.weight.dtype))
+        # Tokens outside the draft vocab can never be proposed.
+        base_logits = hot_logits.new_full(
+            (*hot_logits.shape[:-1], int(self.lm_head.org_vocab_size)), float("-inf")
+        )
+        return base_logits.index_copy_(-1, self.hot_token_id, hot_logits)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         markov_weights = []
         confidence_weights = []
         backbone_weights = []
+        hot_vocab_weights = {}
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             normalized_name = name.removeprefix("model.")
+            if self.hot_lm_head is not None and normalized_name in (
+                "lm_head.weight",
+                "d2t",
+            ):
+                hot_vocab_weights[normalized_name] = loaded_weight
+                continue
             if any(
                 normalized_name.startswith(p) for p in _DSPARK_SKIPPED_WEIGHT_PREFIXES
             ):
@@ -572,6 +606,8 @@ class DSparkDraftMixin:
                 backbone_weights.append((name, loaded_weight))
 
         super().load_weights(backbone_weights)
+        if self.hot_lm_head is not None:
+            self._load_hot_vocab_weights(hot_vocab_weights)
 
         for name, loaded_weight in markov_weights:
             if name not in params_dict:
@@ -580,12 +616,45 @@ class DSparkDraftMixin:
                     f"parameters (known markov params require a {type(self.markov_head).__name__} head)."
                 )
             param = params_dict[name]
+            if self.hot_lm_head is not None and name == "markov_head.markov_w2.weight":
+                loaded_weight = self._spread_hot_rows(
+                    loaded_weight, num_rows=param.shape[0]
+                )
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
 
         self._load_confidence_weights(
             confidence_weights=confidence_weights, params_dict=params_dict
         )
+
+    def _load_hot_vocab_weights(self, hot_vocab_weights: dict) -> None:
+        missing = {"lm_head.weight", "d2t"} - hot_vocab_weights.keys()
+        if missing:
+            raise ValueError(
+                "DSpark reduced-vocab draft (draft_vocab_size < vocab_size) needs "
+                f"its own lm_head and a d2t map; the checkpoint is missing {sorted(missing)}."
+            )
+        default_weight_loader(
+            self.hot_lm_head.weight, hot_vocab_weights["lm_head.weight"]
+        )
+        # d2t stores diffs between draft id and target id.
+        d2t = hot_vocab_weights["d2t"]
+        hot_token_id = d2t + torch.arange(d2t.shape[0], device=d2t.device)
+        if int(hot_token_id.max()) >= self.markov_head.vocab_size:
+            raise ValueError(
+                "DSpark d2t maps a draft token outside the target vocab: "
+                f"max target id {int(hot_token_id.max())}, "
+                f"vocab_size={self.markov_head.vocab_size}."
+            )
+        self.hot_token_id.copy_(hot_token_id)
+
+    def _spread_hot_rows(
+        self, hot_rows: torch.Tensor, *, num_rows: int
+    ) -> torch.Tensor:
+        """Place per-draft-token rows at their target token ids; the rest stay 0."""
+        rows = hot_rows.new_zeros((num_rows, *hot_rows.shape[1:]))
+        rows[self.hot_token_id.to(hot_rows.device)] = hot_rows
+        return rows
 
     def _load_confidence_weights(
         self,
@@ -639,6 +708,9 @@ class DSparkDraftMixin:
         if type(rotary).__name__ != "RotaryEmbedding":
             return None
         if getattr(rotary, "rotary_dim", None) != head_dim:
+            return None
+        # The fused write kernel spans head_dim with tl.arange, which needs a power of 2.
+        if head_dim & (head_dim - 1) != 0:
             return None
         eps = attn0.k_norm.variance_epsilon
         weights, knws, meta_rows = [], [], []
@@ -857,6 +929,7 @@ class DSparkDraftModel(DSparkDraftMixin, DFlashDraftModel):
     def prune_to_ctx_kv_injection(self) -> None:
         self.markov_head = None
         self.confidence_head = None
+        self.hot_lm_head = None
         for layer in self.layers:
             layer.mlp = None
             layer.self_attn.o_proj = None

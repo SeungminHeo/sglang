@@ -119,6 +119,61 @@ def _try_load_raw_mamba_config(model, revision: Optional[str], **kwargs):
     )
 
 
+_SPECULATORS_DSPARK_DRAFT_KEYS = (
+    "draft_vocab_size",
+    "mask_token_id",
+    "markov_rank",
+    "markov_head_type",
+    "block_size",
+    "enable_confidence_head",
+    "confidence_head_with_markov",
+)
+
+
+def _try_load_speculators_dspark_config(model, revision: Optional[str], **kwargs):
+    """Recognize DSpark drafts exported in the speculators format.
+
+    These nest the draft's own transformer config under
+    `transformer_layer_config` and carry no top-level `model_type`, so
+    `AutoConfig.from_pretrained` rejects them with "Unrecognized model ...".
+    Build the nested config and lift the DSpark fields onto it, giving the flat
+    layout the DSpark draft model reads.
+    """
+    config_dict, _ = PretrainedConfig.get_config_dict(
+        model, revision=revision, **kwargs
+    )
+    if config_dict.get("speculators_model_type") != "dspark":
+        return None
+
+    layer_config = dict(config_dict["transformer_layer_config"])
+    # Draft variants switch on extra modules with dspark_* flags; loading one
+    # without them would run, with the wrong proposals.
+    unsupported = sorted(
+        key
+        for key, value in layer_config.items()
+        if key.startswith("dspark_") and value
+    )
+    if unsupported:
+        raise ValueError(
+            f"DSpark draft {model} enables extensions that are not implemented: "
+            f"{unsupported}."
+        )
+    model_type = layer_config.pop("model_type")
+    config = AutoConfig.for_model(model_type, **layer_config)
+    # speculators names the target layer whose input is captured;
+    # target_layer_ids names the layer whose output is.
+    config.target_layer_ids = [
+        layer_id - 1 for layer_id in config_dict["aux_hidden_state_layer_ids"]
+    ]
+    # speculators defaults to a bonus anchor, the DSpark draft model to sampling it.
+    config.sample_from_anchor = config_dict.get("sample_from_anchor", False)
+    for key in _SPECULATORS_DSPARK_DRAFT_KEYS:
+        if config_dict.get(key) is not None:
+            setattr(config, key, config_dict[key])
+    _set_architectures(config, "Qwen3DSparkModel")
+    return config
+
+
 @register_model_config_parser("hf")
 class HfModelConfigParser(ModelConfigParserBase):
     def parse(
@@ -131,6 +186,8 @@ class HfModelConfigParser(ModelConfigParserBase):
         config = _try_load_longcat_config(model, revision, **kwargs)
         if config is None:
             config = _try_load_raw_mamba_config(model, revision, **kwargs)
+        if config is None:
+            config = _try_load_speculators_dspark_config(model, revision, **kwargs)
         if config is None:
             config = AutoConfig.from_pretrained(
                 model,
