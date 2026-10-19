@@ -48,6 +48,7 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
     "LongcatFlashForCausalLMNextN",
     "Dots3NoteForCausalLM",
     "AXK2ForCausalLM",
+    "AXK3ForCausalLM",
 )
 def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     """Declare DeepSeek/DSA defaults; ordered CP, KV-cache, and MoE passes run in model_hook."""
