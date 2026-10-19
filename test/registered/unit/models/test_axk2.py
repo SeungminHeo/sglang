@@ -13,6 +13,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -33,6 +34,7 @@ from sglang.srt.layers.layernorm import RMSNorm  # noqa: E402
 from sglang.srt.layers.quantization.modelopt_quant import (  # noqa: E402
     ModelOptMixedPrecisionConfig,
 )
+from sglang.srt.layers.layer_boundary.factories import layer_stack  # noqa: E402
 from sglang.srt.models.axk2 import (  # noqa: E402
     AXK2ForCausalLM,
     AXK2GatedRMSNorm,
@@ -40,9 +42,11 @@ from sglang.srt.models.axk2 import (  # noqa: E402
     _AXK2FusedQGateProj,
     _AXK2GatedOProj,
     _AXK2SlicedIndexerWqB,
+    _build_axk2_stages,
     _convert_decoder_layer_to_axk2,
     _dequant_modelopt_fp8_indexer_wk,
     _unify_modelopt_fp8_qkv_a_scales,
+    rebind_layer_stack,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer  # noqa: E402
 from sglang.srt.runtime_context import get_parallel  # noqa: E402
@@ -186,8 +190,10 @@ class TestAXK2ConcatQANorm(CustomTestCase):
 
 class TestAXK2FusedQGateProj(CustomTestCase):
     def setUp(self):
-        # RowParallelLinear.forward reads the TP group for symmetric-memory
-        # allocation; no process group exists in this single-process test.
+        # The linears resolve their TP group at construction, and
+        # RowParallelLinear.forward reads it for symmetric-memory allocation;
+        # no process group exists in this single-process test.
+        enter_scope(self, published_topology())
         enter_scope(self, get_parallel().override(tp_group=None))
 
     def _make_pair(self):
@@ -199,8 +205,7 @@ class TestAXK2FusedQGateProj(CustomTestCase):
             v_head_dim=4,
             quant_config=None,
             prefix="",
-            tp_rank=0,
-            tp_size=1,
+            parallel_group="tp",
         )
         o_proj = _AXK2GatedOProj(
             2 * 4,
@@ -209,8 +214,6 @@ class TestAXK2FusedQGateProj(CustomTestCase):
             quant_config=None,
             reduce_results=False,
             prefix="",
-            tp_rank=0,
-            tp_size=1,
         )
         o_proj._take_gate = proj.take_gate
         with torch.no_grad():
@@ -288,20 +291,43 @@ class TestAXK2DecoderLayerConversion(CustomTestCase):
         # The stage boundaries bind their norms when built; swapping only the
         # layer attributes would leave the layer running the ungated RMSNorm.
         config = self._make_config()
+        model = _build_deepseek_layers(config)
+        for layer_id in range(config.num_hidden_layers):
+            _convert_decoder_layer_to_axk2(
+                model.layers[layer_id],
+                config=config,
+                quant_config=None,
+                prefix=f"model.layers.{layer_id}",
+            )
+        rebind_layer_stack(
+            model,
+            stage_facts=partial(DeepseekV2DecoderLayer.stage_facts, config),
+            build_stages=_build_axk2_stages,
+        )
         # Layer 0 is dense (plain post_attention_layernorm), layer 1 is MoE.
         for layer_id, ffn_norm_type in ((0, RMSNorm), (1, AXK2GatedRMSNorm)):
             with self.subTest(layer_id=layer_id):
-                prefix = f"model.layers.{layer_id}"
-                # No GPU platform on the CPU runner: keep rope off its kernel path.
-                with patch("sglang.srt.layers.rotary_embedding.base._is_cpu", True):
-                    layer = DeepseekV2DecoderLayer(config, layer_id, prefix=prefix)
-                _convert_decoder_layer_to_axk2(
-                    layer, config=config, quant_config=None, prefix=prefix
-                )
+                layer = model.layers[layer_id]
                 self.assertIsInstance(layer.input_layernorm, AXK2GatedRMSNorm)
                 self.assertIs(layer.attn_boundary.norm, layer.input_layernorm)
                 self.assertIsInstance(layer.post_attention_layernorm, ffn_norm_type)
                 self.assertIs(layer.ffn_boundary.norm, layer.post_attention_layernorm)
+
+
+def _build_deepseek_layers(config, layer_cls=None):
+    """The DeepSeek decoder layers of ``config`` built in one layer stack, as
+    make_layers builds them, held like DeepseekV2Model holds them."""
+    layer_cls = layer_cls or DeepseekV2DecoderLayer
+    layers = []
+    # No GPU platform on the CPU runner: keep rope off its kernel path.
+    with patch("sglang.srt.layers.rotary_embedding.base._is_cpu", True), layer_stack():
+        for layer_id in range(config.num_hidden_layers):
+            layers.append(
+                layer_cls(config, layer_id, prefix=f"model.layers.{layer_id}")
+            )
+    return SimpleNamespace(
+        layers=layers, start_layer=0, end_layer=config.num_hidden_layers
+    )
 
 
 class TestAXK2SlicedIndexerWqB(CustomTestCase):
