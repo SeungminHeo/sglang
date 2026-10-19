@@ -33,12 +33,14 @@ by swapping four leaf modules. The ``q_a_layernorm`` swap makes every q-LoRA
 consumer downstream see ``cat([normed, raw])``, the fused ``q_b_proj`` swap
 splits that into query + stashed gate, the ``o_proj`` swap consumes the stashed
 gate, and the indexer's ``wq_b`` swap slices the raw half back out — so the
-shared DeepSeek forward mixins run unchanged. CUDA-only for now: the
+shared DeepSeek forward mixins run unchanged. The layer stack is then bound
+again so the stage boundaries pick up the gated norms. CUDA-only for now: the
 ROCm/NPU/CPU fused paths read ``q_a_layernorm.weight`` directly and would
 bypass the concat.
 """
 
-from typing import Iterable, Optional, Tuple
+from functools import partial
+from typing import Callable, Iterable, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -49,6 +51,7 @@ from sglang.kernels.ops.layernorm.lowrank_gated_rmsnorm import (
     LOWRANK_GATED_RMSNORM_MAX_TOKENS,
     lowrank_gated_rmsnorm,
 )
+from sglang.srt.layers.layer_boundary.factories import layer_stack
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -245,8 +248,7 @@ class _AXK2FusedQGateProj(ColumnParallelLinear):
         v_head_dim: int,
         quant_config,
         prefix: str,
-        tp_rank: int,
-        tp_size: int,
+        parallel_group,
     ) -> None:
         super().__init__(
             2 * q_lora_rank,
@@ -254,8 +256,7 @@ class _AXK2FusedQGateProj(ColumnParallelLinear):
             bias=False,
             quant_config=quant_config,
             prefix=prefix,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         self.qk_head_dim = qk_head_dim
         self.v_head_dim = v_head_dim
@@ -353,8 +354,7 @@ def _convert_attention_to_axk2(
         v_head_dim=attn.v_head_dim,
         quant_config=attn._get_q_b_proj_quant_config(quant_config),
         prefix=add_prefix("q_b_proj", prefix),
-        tp_rank=old_q_b_proj.tp_rank,
-        tp_size=old_q_b_proj.tp_size,
+        parallel_group=old_q_b_proj.parallel_group,
     )
     # Init-derived fast-path flags computed from the replaced q_b_proj.
     attn._q_b_proj_verified_shape = False
@@ -368,11 +368,14 @@ def _convert_attention_to_axk2(
         quant_config=quant_config,
         reduce_results=old_o_proj.reduce_results,
         prefix=add_prefix("o_proj", prefix),
-        tp_rank=old_o_proj.tp_rank,
-        tp_size=old_o_proj.tp_size,
+        parallel_group=old_o_proj.parallel_group,
     )
     attn.o_proj._take_gate = attn.q_b_proj.take_gate
 
+    # A layer that reuses the previous layer's top-k (index_topk_pattern "S")
+    # builds no indexer.
+    if attn.indexer is None:
+        return
     attn.indexer.wq_b = _AXK2SlicedIndexerWqB(
         attn.q_lora_rank,
         attn.indexer.n_heads * attn.indexer.head_dim,
@@ -409,13 +412,41 @@ def _convert_decoder_layer_to_axk2(
             eps=config.rms_norm_eps,
             prefix=add_prefix("post_attention_layernorm", prefix),
         )
-    # The stage boundaries bind their norms and choose their fused steps from
-    # them when built, so rebuild them or the layer runs the ungated RMSNorm.
-    layer.attn_boundary, layer.ffn_boundary = layer._build_stages(
+
+
+def _build_axk2_stages(layer: DeepseekV2DecoderLayer):
+    return layer._build_stages(
         input_layernorm=layer.input_layernorm,
         post_attention_layernorm=layer.post_attention_layernorm,
         qkv_latent_func=layer.self_attn.prepare_qkv_latent,
     )
+
+
+def rebind_layer_stack(
+    model: nn.Module,
+    *,
+    stage_facts: Callable[[int], Sequence],
+    build_stages: Callable[[nn.Module], Tuple],
+) -> None:
+    """Rebuild the stage boundaries of every local layer in one new layer stack.
+
+    A stage binds its norm, its fused steps and its neighbours' facts when the
+    stack closes inside make_layers, so layers converted after construction
+    are bound again together, with the other pipeline ranks' layers declared
+    from ``stage_facts`` as make_layers does.
+    """
+    num_layers = len(model.layers)
+    with layer_stack(
+        previous_layers=[
+            partial(stage_facts, idx) for idx in reversed(range(model.start_layer))
+        ],
+        next_layers=[
+            partial(stage_facts, idx) for idx in range(model.end_layer, num_layers)
+        ],
+    ):
+        for layer_id in range(model.start_layer, model.end_layer):
+            layer = model.layers[layer_id]
+            layer.attn_boundary, layer.ffn_boundary = build_stages(layer)
 
 
 def _unify_modelopt_fp8_qkv_a_scales(
@@ -531,10 +562,7 @@ def _dequant_modelopt_fp8_indexer_wk(
 
 class AXK2ForCausalLM(DeepseekV2ForCausalLM):
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
-        assert config.attention_output_gate and config.gated_norm, (
-            "AXK2ForCausalLM requires attention_output_gate=true and "
-            "gated_norm=true; variants without them are not supported."
-        )
+        self._check_config(config)
         super().__init__(config, quant_config=quant_config, prefix=prefix)
         if _is_hip or _is_npu or _is_xpu:
             raise NotImplementedError(
@@ -552,12 +580,28 @@ class AXK2ForCausalLM(DeepseekV2ForCausalLM):
             )
         model_prefix = add_prefix("model", prefix)
         for layer_id in range(self.model.start_layer, self.model.end_layer):
-            _convert_decoder_layer_to_axk2(
+            self._convert_decoder_layer(
                 self.model.layers[layer_id],
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix(f"layers.{layer_id}", model_prefix),
             )
+        rebind_layer_stack(
+            self.model,
+            stage_facts=partial(self._layer_stage_facts, config),
+            build_stages=self._build_layer_stages,
+        )
+
+    @staticmethod
+    def _check_config(config) -> None:
+        assert config.attention_output_gate and config.gated_norm, (
+            "AXK2ForCausalLM requires attention_output_gate=true and "
+            "gated_norm=true; variants without them are not supported."
+        )
+
+    _convert_decoder_layer = staticmethod(_convert_decoder_layer_to_axk2)
+    _build_layer_stages = staticmethod(_build_axk2_stages)
+    _layer_stage_facts = staticmethod(DeepseekV2DecoderLayer.stage_facts)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         weights = _unify_modelopt_fp8_qkv_a_scales(self._remap_axk2_names(weights))
@@ -568,9 +612,14 @@ class AXK2ForCausalLM(DeepseekV2ForCausalLM):
     def _indexer_fuses_wk(self) -> bool:
         """Whether ``wk`` loads into the BF16 fused ``wk_weights_proj``; the
         unfused ``wk`` is a quantized linear that takes the checkpoint as-is."""
-        return any(
-            self.model.layers[layer_id].self_attn.indexer.use_dsa_indexer_fusion
+        indexers = (
+            self.model.layers[layer_id].self_attn.indexer
             for layer_id in range(self.model.start_layer, self.model.end_layer)
+        )
+        return any(
+            indexer.use_dsa_indexer_fusion
+            for indexer in indexers
+            if indexer is not None
         )
 
     @staticmethod
