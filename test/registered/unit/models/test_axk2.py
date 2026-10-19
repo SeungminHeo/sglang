@@ -1,4 +1,4 @@
-"""Unit tests for the SKT A.X-K2 (AXK2ForCausalLM) port.
+"""Unit tests for the SKT A.X-K2 (AXK2ForCausalLM) and A.X-K3 (AXK3ForCausalLM) ports.
 
 Covers the pieces that can be verified without a GPU: config/arch
 registration, checkpoint weight-name remapping, the numerics of the
@@ -6,6 +6,8 @@ modules A.X-K2 adds on top of DeepSeek-V3.2 (gated RMSNorm, the concatenated
 q_a_layernorm, the fused query/output-gate projection handshake with o_proj,
 and the indexer wq_b slice), and the A.X-K2-NVFP4 (ModelOpt MIXED_PRECISION)
 load path: per-layer quant resolution and the per-tensor FP8 weight rewrites.
+For A.X-K3: the config routing to the shared top-k pattern, the gated
+residual's checkpoint mapping and numerics, and the layer conversion.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -29,12 +31,20 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.configs.model_config import is_deepseek_dsa  # noqa: E402
+from sglang.srt.configs.model_config import (  # noqa: E402
+    dsa_layer_skips_topk,
+    is_deepseek_dsa,
+)
+from sglang.srt.layers.hyperconnection import (  # noqa: E402
+    GatedResidual,
+    HyperConnectionConfig,
+)
+from sglang.srt.layers.layer_boundary.factories import layer_stack  # noqa: E402
 from sglang.srt.layers.layernorm import RMSNorm  # noqa: E402
 from sglang.srt.layers.quantization.modelopt_quant import (  # noqa: E402
     ModelOptMixedPrecisionConfig,
 )
-from sglang.srt.layers.layer_boundary.factories import layer_stack  # noqa: E402
+from sglang.srt.model_loader.weight_utils import default_weight_loader  # noqa: E402
 from sglang.srt.models.axk2 import (  # noqa: E402
     AXK2ForCausalLM,
     AXK2GatedRMSNorm,
@@ -48,9 +58,48 @@ from sglang.srt.models.axk2 import (  # noqa: E402
     _unify_modelopt_fp8_qkv_a_scales,
     rebind_layer_stack,
 )
+from sglang.srt.models.axk3 import (  # noqa: E402
+    AXK3ForCausalLM,
+    _remap_gated_residual_weights,
+)
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer  # noqa: E402
 from sglang.srt.runtime_context import get_parallel  # noqa: E402
 from sglang.srt.utils.hf_transformers.common import _CONFIG_REGISTRY  # noqa: E402
+
+
+def _tiny_axk2_config(**overrides):
+    fields = dict(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        moe_intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        n_shared_experts=1,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        first_k_dense_replace=1,
+        moe_layer_freq=1,
+        kv_lora_rank=16,
+        q_lora_rank=24,
+        qk_rope_head_dim=8,
+        qk_nope_head_dim=8,
+        v_head_dim=8,
+        max_position_embeddings=256,
+        rms_norm_eps=1e-6,
+        architectures=["AXK2ForCausalLM"],
+        index_topk=16,
+        index_n_heads=2,
+        index_head_dim=8,
+        gated_norm_rank=4,
+        topk_method="noaux_tc",
+        n_group=2,
+        topk_group=2,
+        routed_scaling_factor=1.0,
+        scoring_func="sigmoid",
+    )
+    fields.update(overrides)
+    return _CONFIG_REGISTRY["axk2"](**fields)
 
 
 class TestAXK2Registration(CustomTestCase):
@@ -256,36 +305,7 @@ class TestAXK2DecoderLayerConversion(CustomTestCase):
         enter_scope(self, published_topology())
 
     def _make_config(self):
-        return _CONFIG_REGISTRY["axk2"](
-            vocab_size=128,
-            hidden_size=64,
-            intermediate_size=128,
-            moe_intermediate_size=32,
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            n_shared_experts=1,
-            n_routed_experts=4,
-            num_experts_per_tok=2,
-            first_k_dense_replace=1,
-            moe_layer_freq=1,
-            kv_lora_rank=16,
-            q_lora_rank=24,
-            qk_rope_head_dim=8,
-            qk_nope_head_dim=8,
-            v_head_dim=8,
-            max_position_embeddings=256,
-            rms_norm_eps=1e-6,
-            architectures=["AXK2ForCausalLM"],
-            index_topk=16,
-            index_n_heads=2,
-            index_head_dim=8,
-            gated_norm_rank=4,
-            topk_method="noaux_tc",
-            n_group=2,
-            topk_group=2,
-            routed_scaling_factor=1.0,
-            scoring_func="sigmoid",
-        )
+        return _tiny_axk2_config()
 
     def test_stage_boundaries_bind_the_gated_norms(self):
         # The stage boundaries bind their norms when built; swapping only the
@@ -518,6 +538,169 @@ class TestAXK2ModelOptFp8IndexerWk(CustomTestCase):
         self.assertEqual(sorted(out), sorted(name for name, _ in stream))
         for name, tensor in stream:
             self.assertIs(out[name], tensor)
+
+
+def _tiny_axk3_config(**overrides):
+    """A.X-K3 Flash in miniature: one indexer layer then three that share its
+    top-k, all MoE, on a gated residual stream."""
+    fields = dict(
+        num_hidden_layers=4,
+        first_k_dense_replace=0,
+        layer_types=["full_attention"] + ["sliding_attention"] * 3,
+        swa_window_size=256,
+        dsa_index_share=True,
+        gated_residual=True,
+        gated_residual_num_streams=2,
+        gated_residual_rank=4,
+        gated_residual_final="gated_read",
+        attention_output_gate=True,
+        gated_norm=True,
+    )
+    fields.update(overrides)
+    return _tiny_axk2_config(**fields)
+
+
+class TestAXK3Config(CustomTestCase):
+    def test_k3_flags_route_to_axk3_with_a_shared_topk_pattern(self):
+        config = _tiny_axk3_config()
+        self.assertEqual(config.architectures, ["AXK3ForCausalLM"])
+        self.assertTrue(is_deepseek_dsa(config))
+        self.assertEqual(
+            [dsa_layer_skips_topk(config, i) for i in range(4)],
+            [False, True, True, True],
+        )
+
+    def test_k2_config_keeps_its_architecture(self):
+        config = _tiny_axk2_config()
+        self.assertEqual(config.architectures, ["AXK2ForCausalLM"])
+        self.assertFalse(dsa_layer_skips_topk(config, 1))
+
+    def test_window_shorter_than_the_context_is_rejected(self):
+        # Sliding layers run as top-k consumers over the whole context only.
+        with self.assertRaisesRegex(ValueError, "swa_window_size"):
+            _tiny_axk3_config(swa_window_size=128)
+
+
+class TestAXK3GatedResidualWeights(CustomTestCase):
+    N, H, R = 2, 8, 4
+
+    def _checkpoint(self, prefix):
+        torch.manual_seed(0)
+        n, h, r = self.N, self.H, self.R
+        return {
+            f"{prefix}.gamma": 1.0 + 0.25 * torch.randn(n * h),
+            f"{prefix}.read_down.weight": torch.randn(r, n * h),
+            f"{prefix}.read_up.weight": torch.randn(n * h, r),
+            f"{prefix}.write_proj.weight": torch.randn(n, n * h),
+            f"{prefix}.write_bias": torch.zeros(n),
+        }
+
+    def test_loaded_module_matches_the_checkpoint_formulas(self):
+        """The read and write of the checkpoint's AXK2GatedResidual (HF
+        modeling_axk2.py): per-branch RMSNorm with gain gamma, then
+        x = mean_i(sigmoid(read_up(silu(read_down(U) / n)))_i * U_i) and
+        R'_i = R_i + 2 * sigmoid(write_proj(U) / n + write_bias)_i * y."""
+        n, h = self.N, self.H
+        prefix = "model.layers.0.attn_gated_residual"
+        ckpt = self._checkpoint(prefix)
+        module = GatedResidual(
+            HyperConnectionConfig(
+                hc_count=n,
+                hidden_size=h,
+                params_dtype=torch.float32,
+                hc_lowrank=self.R,
+                rms_norm_eps=1e-6,
+                hc_per_branch_norm=True,
+            )
+        )
+        params = dict(module.named_parameters())
+        for name, weight in _remap_gated_residual_weights(ckpt.items()):
+            param = params[name.removeprefix(prefix + ".")]
+            getattr(param, "weight_loader", default_weight_loader)(param, weight)
+
+        x, y = torch.randn(3, n * h), torch.randn(3, h)
+        with torch._dynamo.config.patch(disable=True):
+            mixed, residuals = module.mix(x)
+            written = module.combine(y, residuals)
+
+        streams = x.view(3, n, h)
+        rstd = torch.rsqrt(streams.pow(2).mean(-1, keepdim=True) + 1e-6)
+        u = (streams * rstd * ckpt[f"{prefix}.gamma"].view(n, h)).view(3, n * h)
+        z = F.silu(u @ ckpt[f"{prefix}.read_down.weight"].T / n)
+        gate = torch.sigmoid(z @ ckpt[f"{prefix}.read_up.weight"].T)
+        expected_mixed = (gate * u).view(3, n, h).mean(dim=-2)
+        write_gate = 2 * torch.sigmoid(
+            u @ ckpt[f"{prefix}.write_proj.weight"].T / n + ckpt[f"{prefix}.write_bias"]
+        )
+        expected_written = (streams + write_gate.unsqueeze(-1) * y.unsqueeze(-2)).view(
+            3, n * h
+        )
+        torch.testing.assert_close(mixed, expected_mixed)
+        torch.testing.assert_close(written, expected_written)
+
+    def test_checkpoint_names_and_bf16_gains(self):
+        # Every bf16 gain in [0.5, 4.5] (the checkpoint spans 0.50-4.28) must
+        # survive the gamma - 1 offset exactly.
+        gains = torch.arange(0.5, 4.5, 2**-6).to(torch.bfloat16)
+        weights = [
+            ("model.final_gated_residual.gamma", gains),
+            ("model.final_gated_residual.read_up.weight", torch.zeros(1)),
+            ("model.layers.3.mlp_gated_residual.write_proj.weight", torch.zeros(1)),
+            ("model.layers.3.mlp_gated_residual.write_bias", torch.zeros(4)),
+            ("model.layers.3.self_attn.q_b_proj.weight", torch.zeros(1)),
+        ]
+        remapped = dict(_remap_gated_residual_weights(weights))
+        self.assertEqual(
+            list(remapped),
+            [
+                "model.norm.gated_residual.hc_norm.weight",
+                "model.norm.gated_residual.input_mix_weight_up.weight",
+                "model.layers.3.mlp_gated_residual.block_inject_weight.weight",
+                "model.layers.3.self_attn.q_b_proj.weight",
+            ],
+        )
+        offset = remapped["model.norm.gated_residual.hc_norm.weight"]
+        self.assertEqual(offset.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(1.0 + offset.float(), gains.float()))
+
+    def test_nonzero_write_bias_is_rejected(self):
+        weights = [("model.layers.0.attn_gated_residual.write_bias", torch.ones(2))]
+        with self.assertRaises(NotImplementedError):
+            list(_remap_gated_residual_weights(weights))
+
+
+class TestAXK3DecoderLayerConversion(CustomTestCase):
+    def setUp(self):
+        enter_scope(self, published_topology())
+
+    def test_shared_topk_and_gated_residual_layers(self):
+        config = _tiny_axk3_config()
+        model = _build_deepseek_layers(config)
+        for layer_id in range(config.num_hidden_layers):
+            AXK3ForCausalLM._convert_decoder_layer(
+                model.layers[layer_id],
+                config=config,
+                quant_config=None,
+                prefix=f"model.layers.{layer_id}",
+            )
+        rebind_layer_stack(
+            model,
+            stage_facts=partial(AXK3ForCausalLM._layer_stage_facts, config),
+            build_stages=AXK3ForCausalLM._build_layer_stages,
+        )
+        for layer_id, layer in enumerate(model.layers):
+            with self.subTest(layer_id=layer_id):
+                attn = layer.self_attn
+                self.assertIsInstance(attn.q_b_proj, _AXK2FusedQGateProj)
+                if layer_id == 0:
+                    self.assertIsInstance(attn.indexer.wq_b, _AXK2SlicedIndexerWqB)
+                else:
+                    self.assertIsNone(attn.indexer)
+                # The gated reads normalize the streams; no stage binds a norm.
+                self.assertFalse(hasattr(layer, "input_layernorm"))
+                self.assertIsNone(layer.attn_boundary.norm)
+                self.assertIsNone(layer.ffn_boundary.norm)
+                self.assertIsInstance(layer.mlp_gated_residual, GatedResidual)
 
 
 if __name__ == "__main__":

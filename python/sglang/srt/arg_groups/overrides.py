@@ -757,6 +757,7 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "LongcatFlashForCausalLMNextN",
         "Dots3NoteForCausalLM",
         "AXK2ForCausalLM",
+        "AXK3ForCausalLM",
     }
 )
 
