@@ -93,7 +93,9 @@ def hc_combine(
 
 
 _SPLIT = 8
-_MAX_ROWS = 32
+# Covers every row count GatedResidual sends to the split path, so a CUDA graph
+# never sees the buffer reallocated under it.
+_MAX_ROWS = 64
 _partials_cache = {}
 
 

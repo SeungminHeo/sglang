@@ -206,8 +206,13 @@ namespace hc_combine_split_detail {
 constexpr uint32_t kSplit = 8;
 constexpr uint32_t kRefThreads = 256;
 constexpr uint32_t kGateThreads = 32;
-constexpr uint32_t kApplyThreads = 160;
 constexpr uint32_t kVecLen = 8;
+
+/// One thread per 16-byte vector of a split's row slice (160 for 4 x 2560, 256 for 4 x 4096).
+template <int64_t kHcCount, int64_t kHiddenSize>
+constexpr uint32_t apply_threads() {
+  return static_cast<uint32_t>(kHcCount * kHiddenSize / kVecLen / kSplit);
+}
 
 }  // namespace hc_combine_split_detail
 
@@ -280,7 +285,8 @@ __global__ __launch_bounds__(hc_combine_split_detail::kGateThreads) void hc_comb
  * per-CTA scalar.
  */
 template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, typename Float>
-__global__ __launch_bounds__(hc_combine_split_detail::kApplyThreads) void hc_combine_apply_kernel(
+__global__
+__launch_bounds__(hc_combine_split_detail::apply_threads<kHcCount, kHiddenSize>()) void hc_combine_apply_kernel(
     const HcCombineSplitParams __grid_constant__ params) {
   using namespace device;
   using namespace hc_combine_split_detail;
@@ -289,9 +295,11 @@ __global__ __launch_bounds__(hc_combine_split_detail::kApplyThreads) void hc_com
   constexpr int64_t kRowSize = kHcCount * kHiddenSize;
   constexpr uint32_t kVecsPerRow = kRowSize / kVecLen;
   constexpr uint32_t kVecsPerSplit = kVecsPerRow / kSplit;
+  constexpr uint32_t kApplyThreads = apply_threads<kHcCount, kHiddenSize>();
   constexpr uint32_t kVecsPerThread = kVecsPerSplit / kApplyThreads;
   constexpr uint32_t kVecsPerBranch = kHiddenSize / kVecLen;
   static_assert(kVecsPerBranch % kVecsPerSplit == 0);
+  static_assert(kApplyThreads <= 1024 && kVecsPerThread * kApplyThreads == kVecsPerSplit);
 
   const uint32_t m = blockIdx.x;
   const uint32_t split = blockIdx.y;
@@ -374,7 +382,8 @@ struct HcCombineSplitKernel {
     const auto num_tokens = static_cast<uint32_t>(M.unwrap());
     LaunchKernel(dim3(num_tokens, kSplit * kHcCount, 1), kGateThreads, device.unwrap())
         .enable_pdl(kUsePDL)(gate_kernel, params);
-    LaunchKernel(dim3(num_tokens, kSplit, 1), kApplyThreads, device.unwrap()).enable_pdl(kUsePDL)(apply_kernel, params);
+    LaunchKernel(dim3(num_tokens, kSplit, 1), apply_threads<kHcCount, kHiddenSize>(), device.unwrap())
+        .enable_pdl(kUsePDL)(apply_kernel, params);
   }
 };
 
