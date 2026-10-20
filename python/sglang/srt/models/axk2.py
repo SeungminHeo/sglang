@@ -14,7 +14,7 @@
 """Inference-only SKT A.X-K2 (AXK2ForCausalLM).
 
 A.X-K2 is a DeepSeek-V3.2 derivative (MLA + DeepSeek MoE + DSA sparse-attention
-indexer, block-FP8 checkpoint) with three deviations:
+indexer, block-FP8 checkpoint) with two deviations:
 
 1. Sparse Gated Attention output gate: the checkpoint's ``q_b_proj`` is a fused
    projection ``Linear(2 * q_lora_rank, num_heads * (qk_head_dim + v_head_dim))``
@@ -24,16 +24,15 @@ indexer, block-FP8 checkpoint) with three deviations:
 2. Gated RMSNorm: ``input_layernorm`` on every layer and
    ``post_attention_layernorm`` on MoE layers wrap RMSNorm with a low-rank
    input-dependent gate ``y * sigmoid(W_up(silu(W_down(y))))``.
-3. The DSA indexer consumes the *pre-norm* ``q_c`` (DeepSeek-V3.2 feeds it the
-   normed q-LoRA).
 
 This file is self-contained: ``AXK2ForCausalLM`` lets the unmodified
 DeepSeek-V2 classes build the model, then converts each decoder layer in place
 by swapping four leaf modules. The ``q_a_layernorm`` swap makes every q-LoRA
 consumer downstream see ``cat([normed, raw])``, the fused ``q_b_proj`` swap
 splits that into query + stashed gate, the ``o_proj`` swap consumes the stashed
-gate, and the indexer's ``wq_b`` swap slices the raw half back out — so the
-shared DeepSeek forward mixins run unchanged. The layer stack is then bound
+gate, and the indexer's ``wq_b`` swap slices the normed half back out (the
+indexer reads the normed q-LoRA, as in DeepSeek-V3.2), so the shared DeepSeek
+forward mixins run unchanged. The layer stack is then bound
 again so the stage boundaries pick up the gated norms. CUDA-only for now: the
 ROCm/NPU/CPU fused paths read ``q_a_layernorm.weight`` directly and would
 bypass the concat.
@@ -181,7 +180,7 @@ class _AXK2ConcatQANorm(RMSNorm):
     """q_a_layernorm that returns ``cat([RMSNorm(q_c), q_c], -1)``.
 
     The fused q/gate projection consumes both the normed and the raw q-LoRA
-    bottleneck, and the DSA indexer consumes only the raw half; widening this
+    bottleneck, and the DSA indexer consumes only the normed half; widening this
     module's output lets both flow through the unmodified DeepSeek forward
     mixins (which treat the q-LoRA activation as an opaque tensor between
     ``q_a_layernorm`` and ``q_b_proj`` / the indexer).
@@ -315,11 +314,10 @@ class _AXK2GatedOProj(RowParallelLinear):
 
 
 class _AXK2SlicedIndexerWqB(ReplicatedLinear):
-    """Indexer ``wq_b`` that consumes the raw (pre-norm) half of the q-LoRA concat.
+    """Indexer ``wq_b`` that consumes the normed half of the q-LoRA concat.
 
-    A.X-K2 feeds the indexer ``q_c = q_a_proj(x)`` where DeepSeek-V3.2 feeds it
-    ``q_a_layernorm(q_c)``; with the concat layout ``[normed | raw]`` the raw
-    half is the trailing ``input_size`` slice.
+    The indexer reads ``q_a_layernorm(q_c)`` as in DeepSeek-V3.2; with the
+    concat layout ``[normed | raw]`` that is the leading ``input_size`` slice.
     """
 
     def forward(self, x: torch.Tensor):
@@ -327,7 +325,7 @@ class _AXK2SlicedIndexerWqB(ReplicatedLinear):
             f"indexer wq_b expected the {2 * self.input_size}-wide q-LoRA "
             f"concat, got width {x.shape[-1]}"
         )
-        return super().forward(x[..., self.input_size :].contiguous())
+        return super().forward(x[..., : self.input_size].contiguous())
 
 
 def _convert_attention_to_axk2(
