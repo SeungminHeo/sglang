@@ -179,14 +179,18 @@ class GatedResidual(HyperConnectionBase):
                 and (self.hc_count * self.hidden_size) % 2048 == 0
             )
             vecs = self.hc_count * self.hidden_size // 8
+            # The split apply kernel runs one thread per vector of a 1/8 row slice.
             self._split_combine_ok = (
                 self._jit_combine_ok
-                and vecs % (8 * 160) == 0
+                and vecs // 8 <= 1024
                 and (self.hidden_size // 8) % (vecs // 8) == 0
             )
+            # Measured on B200 in a CUDA graph: split beats the one-CTA-per-row
+            # kernel up to ~48 rows at 4 x 2560 and ~64 rows at 4 x 4096.
+            self._split_combine_max_rows = 64 if self.hidden_size >= 4096 else 32
             if (
                 self.hc_count == 4
-                and self.hidden_size == 2560
+                and self._split_combine_ok
                 and config.hc_per_branch_norm
                 and config.params_dtype == torch.bfloat16
                 and torch.cuda.is_available()
@@ -378,7 +382,10 @@ class GatedResidual(HyperConnectionBase):
             and hyper_input_normed.dtype == block_output.dtype
             and self.block_inject_weight.weight.dtype == block_output.dtype
         ):
-            if self._split_combine_ok and block_output.shape[0] <= 32:
+            if (
+                self._split_combine_ok
+                and block_output.shape[0] <= self._split_combine_max_rows
+            ):
                 from sglang.kernels.ops.elementwise.hc_combine import (
                     hc_combine_split,
                 )
