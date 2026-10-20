@@ -3,14 +3,17 @@
 
 namespace sglang {
 // Expose the existing two stock stages separately; all arithmetic is unchanged.
+template <int64_t kHiddenSize>
 struct HcCombineDecode {
+  static constexpr int64_t kRowSize = 4 * kHiddenSize;
+
   static void gate(tvm::ffi::TensorView normed, tvm::ffi::TensorView weight, tvm::ffi::TensorView partials) {
     using namespace host;
     SymbolicSize m{"rows"};
     SymbolicDevice dev;
     dev.set_options<kDLCUDA>();
-    TensorMatcher({m, 10240}).with_dtype<bf16_t>().with_device(dev).verify(normed);
-    TensorMatcher({4, 10240}).with_dtype<bf16_t>().with_device(dev).verify(weight);
+    TensorMatcher({m, kRowSize}).with_dtype<bf16_t>().with_device(dev).verify(normed);
+    TensorMatcher({4, kRowSize}).with_dtype<bf16_t>().with_device(dev).verify(weight);
     TensorMatcher({m, 8, 4}).with_dtype<fp32_t>().with_device(dev).verify(partials);
     const HcCombineSplitParams params{
         .block_output = nullptr,
@@ -20,7 +23,7 @@ struct HcCombineDecode {
         .output = nullptr,
         .partials = static_cast<float*>(partials.data_ptr())};
     LaunchKernel(dim3(m.unwrap(), 32, 1), 32, dev.unwrap())
-        .enable_pdl(true)(hc_combine_gate_kernel<4, 2560, true, bf16_t>, params);
+        .enable_pdl(true)(hc_combine_gate_kernel<4, kHiddenSize, true, bf16_t>, params);
   }
   static void apply(
       tvm::ffi::TensorView block,
@@ -31,8 +34,8 @@ struct HcCombineDecode {
     SymbolicSize m{"rows"};
     SymbolicDevice dev;
     dev.set_options<kDLCUDA>();
-    TensorMatcher({m, 2560}).with_dtype<bf16_t>().with_device(dev).verify(block);
-    TensorMatcher({m, 10240}).with_dtype<bf16_t>().with_device(dev).verify(residual).verify(out);
+    TensorMatcher({m, kHiddenSize}).with_dtype<bf16_t>().with_device(dev).verify(block);
+    TensorMatcher({m, kRowSize}).with_dtype<bf16_t>().with_device(dev).verify(residual).verify(out);
     TensorMatcher({m, 8, 4}).with_dtype<fp32_t>().with_device(dev).verify(partials);
     const HcCombineSplitParams params{
         .block_output = block.data_ptr(),
@@ -41,8 +44,8 @@ struct HcCombineDecode {
         .inject_weight = nullptr,
         .output = out.data_ptr(),
         .partials = static_cast<float*>(partials.data_ptr())};
-    LaunchKernel(dim3(m.unwrap(), 8, 1), 160, dev.unwrap())
-        .enable_pdl(true)(hc_combine_apply_kernel<4, 2560, true, bf16_t>, params);
+    LaunchKernel(dim3(m.unwrap(), 8, 1), hc_combine_split_detail::apply_threads<4, kHiddenSize>(), dev.unwrap())
+        .enable_pdl(true)(hc_combine_apply_kernel<4, kHiddenSize, true, bf16_t>, params);
   }
 };
 struct HcCombineNormDecodeParams {

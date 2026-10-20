@@ -2,7 +2,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.elementwise.hc_combine import hc_combine
+from sglang.kernels.ops.elementwise.hc_combine import hc_combine, hc_combine_split
+from sglang.kernels.ops.elementwise.hc_combine_decode import (
+    hc_combine_apply,
+    hc_combine_gate,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -153,6 +157,34 @@ def test_hc_combine_bad_hidden_size():
             4,
             1000,
         )
+
+
+@pytest.mark.parametrize("hidden_size", [2560, 4096])
+@pytest.mark.parametrize("num_tokens", [1, 7, 32, 64, 200])
+def test_hc_combine_split_matches_single_cta(hidden_size, num_tokens):
+    """The split combine replays the single-CTA reduction order, so both are bit-identical."""
+    inputs = _make_inputs(num_tokens, torch.bfloat16, hs=hidden_size)
+    expected = hc_combine(*inputs, HC_COUNT, hidden_size)
+
+    out = hc_combine_split(*inputs, HC_COUNT, hidden_size)
+
+    assert torch.equal(out, expected)
+
+
+@pytest.mark.parametrize("hidden_size", [2560, 4096])
+@pytest.mark.parametrize("num_tokens", [1, 4])
+def test_hc_combine_decode_gate_apply_matches_single_cta(hidden_size, num_tokens):
+    block_output, residual, normed_residual, inject_weight = _make_inputs(
+        num_tokens, torch.bfloat16, hs=hidden_size
+    )
+    expected = hc_combine(
+        block_output, residual, normed_residual, inject_weight, HC_COUNT, hidden_size
+    )
+
+    partials = hc_combine_gate(normed_residual, inject_weight)
+    out = hc_combine_apply(block_output, residual, partials)
+
+    assert torch.equal(out, expected)
 
 
 if __name__ == "__main__":
