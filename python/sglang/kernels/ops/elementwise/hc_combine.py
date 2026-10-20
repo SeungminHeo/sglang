@@ -93,9 +93,9 @@ def hc_combine(
 
 
 _SPLIT = 8
-# Covers every row count GatedResidual sends to the split path, so a CUDA graph
-# never sees the buffer reallocated under it.
-_MAX_ROWS = 64
+# Callers must not send more rows to the split path than this, so a CUDA graph
+# never sees the partials buffer reallocated under it.
+SPLIT_MAX_ROWS = 64
 _partials_cache = {}
 
 
@@ -106,7 +106,7 @@ def _get_partials(hc_count: int, device: torch.device, rows: int) -> torch.Tenso
         # The gate kernel writes one slot per (row, split, hc); a buffer shorter
         # than `rows` is written past its end rather than truncated.
         buf = torch.empty(
-            (max(rows, _MAX_ROWS), _SPLIT, hc_count),
+            (max(rows, SPLIT_MAX_ROWS), _SPLIT, hc_count),
             dtype=torch.float32,
             device=device,
         )
