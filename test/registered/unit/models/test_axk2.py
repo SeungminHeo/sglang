@@ -305,14 +305,16 @@ class TestAXK2DecoderLayerConversion(CustomTestCase):
 
 
 class TestAXK2SlicedIndexerWqB(CustomTestCase):
-    def test_consumes_raw_half(self):
+    def test_consumes_normed_half(self):
+        """The indexer reads the normed q-LoRA (the leading half of the concat),
+        as transformers' AXK2Attention does; the raw half changes its top-k."""
         torch.manual_seed(0)
         wq_b = _AXK2SlicedIndexerWqB(4, 6, bias=False, quant_config=None, prefix="")
         with torch.no_grad():
             wq_b.weight.normal_(std=0.1)
         x = torch.randn(3, 8)
         out, _ = wq_b(x)
-        torch.testing.assert_close(out, F.linear(x[:, 4:], wq_b.weight))
+        torch.testing.assert_close(out, F.linear(x[:, :4], wq_b.weight))
 
     def test_rejects_unconcatenated_input(self):
         wq_b = _AXK2SlicedIndexerWqB(4, 6, bias=False, quant_config=None, prefix="")
