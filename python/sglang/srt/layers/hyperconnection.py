@@ -6,6 +6,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.elementwise.hc_combine import (
+    SPLIT_MAX_ROWS as HC_COMBINE_SPLIT_MAX_ROWS,
+)
 from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
 
 
@@ -187,7 +190,9 @@ class GatedResidual(HyperConnectionBase):
             )
             # Measured on B200 in a CUDA graph: split beats the one-CTA-per-row
             # kernel up to ~48 rows at 4 x 2560 and ~64 rows at 4 x 4096.
-            self._split_combine_max_rows = 64 if self.hidden_size >= 4096 else 32
+            self._split_combine_max_rows = min(
+                64 if self.hidden_size >= 4096 else 32, HC_COMBINE_SPLIT_MAX_ROWS
+            )
             if (
                 self.hc_count == 4
                 and self._split_combine_ok
