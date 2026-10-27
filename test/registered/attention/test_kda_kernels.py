@@ -1,4 +1,5 @@
 import unittest
+import unittest.mock
 
 import torch
 import triton
@@ -159,7 +160,7 @@ class TestKDAFusedSigmoidGatingRecurrent(unittest.TestCase):
             device=self.device,
         )
 
-    def run_fused(self):
+    def run_fused(self, allow_neg_eigval=False):
         ssm_states = self.ssm_states.clone()
         core_attn_out = fused_sigmoid_gating_delta_rule_update(
             A_log=self.A_log,
@@ -176,11 +177,14 @@ class TestKDAFusedSigmoidGatingRecurrent(unittest.TestCase):
             softplus_beta=self.softplus_beta,
             softplus_threshold=self.softplus_threshold,
             is_kda=True,
+            allow_neg_eigval=allow_neg_eigval,
         )
         return core_attn_out, ssm_states[self.cache_indices]
 
-    def run_kda(self):
+    def run_kda(self, allow_neg_eigval=False):
         b = self.beta.float().sigmoid()
+        if allow_neg_eigval:
+            b = b * 2.0
         # Reference gate activation using torch ops:
         #   g = -exp(A_log) * softplus(raw_g + dt_bias)
         H, K = self.local_num_heads, self.head_dim
@@ -213,6 +217,16 @@ class TestKDAFusedSigmoidGatingRecurrent(unittest.TestCase):
             torch.allclose(core_attn_out, core_attn_out_ref, rtol=1e-3, atol=1e-4)
         )
         self.assertTrue(torch.allclose(last_state, last_state_ref))
+
+    def test_kda_fused_sigmoid_gating_recurrent_allow_neg_eigval(self):
+        """In-kernel beta must be 2 * sigmoid(b) (Solar Open 2), matching the
+        pre-activated beta the model hands chunk/recurrent KDA on prefill."""
+        core_attn_out, last_state = self.run_fused(allow_neg_eigval=True)
+        core_attn_out_ref, last_state_ref = self.run_kda(allow_neg_eigval=True)
+        torch.testing.assert_close(
+            core_attn_out, core_attn_out_ref, rtol=1e-3, atol=1e-4
+        )
+        torch.testing.assert_close(last_state, last_state_ref)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
@@ -485,6 +499,7 @@ class TestKDAPackedDecode(unittest.TestCase):
         K,
         V,
         lower_bound=None,
+        allow_neg_eigval=False,
     ):
         B = mixed_qkv.shape[0]
         q_flat, k_flat, v_flat = torch.split(mixed_qkv, [H * K, H * K, HV * V], dim=-1)
@@ -512,6 +527,7 @@ class TestKDAPackedDecode(unittest.TestCase):
             use_qk_l2norm_in_kernel=True,
             is_kda=True,
             lower_bound=lower_bound,
+            allow_neg_eigval=allow_neg_eigval,
         )
 
     @staticmethod
@@ -527,6 +543,7 @@ class TestKDAPackedDecode(unittest.TestCase):
         K,
         V,
         lower_bound=None,
+        allow_neg_eigval=False,
     ):
         B = mixed_qkv.shape[0]
         out = mixed_qkv.new_empty(B, 1, HV, V)
@@ -542,16 +559,28 @@ class TestKDAPackedDecode(unittest.TestCase):
             ssm_state_indices=cache_indices,
             use_qk_l2norm_in_kernel=True,
             lower_bound=lower_bound,
+            allow_neg_eigval=allow_neg_eigval,
         )
         return out.transpose(0, 1)
 
-    def _check(self, B, H, HV, K, V, lower_bound=None):
+    def _check(
+        self,
+        B,
+        H,
+        HV,
+        K,
+        V,
+        lower_bound=None,
+        allow_neg_eigval=False,
+        state_dtype=torch.bfloat16,
+    ):
         device = get_device()
         dtype = torch.bfloat16
         pool_size = B + 4
         mixed_qkv, a, b, A_log, dt_bias, ssm_states, cache_indices = self._make_inputs(
             B, H, HV, K, V, pool_size, dtype, device
         )
+        ssm_states = ssm_states.to(state_dtype)
         s_packed = ssm_states.clone()
         s_baseline = ssm_states.clone()
 
@@ -567,6 +596,7 @@ class TestKDAPackedDecode(unittest.TestCase):
             K,
             V,
             lower_bound=lower_bound,
+            allow_neg_eigval=allow_neg_eigval,
         )
         o_baseline = self._run_baseline(
             mixed_qkv,
@@ -581,6 +611,7 @@ class TestKDAPackedDecode(unittest.TestCase):
             K,
             V,
             lower_bound=lower_bound,
+            allow_neg_eigval=allow_neg_eigval,
         )
 
         torch.testing.assert_close(
@@ -611,6 +642,31 @@ class TestKDAPackedDecode(unittest.TestCase):
 
     def test_safe_gate_lower_bound(self):
         self._check(B=8, H=16, HV=16, K=128, V=128, lower_bound=-5.0)
+
+    def test_allow_neg_eigval(self):
+        self._check(B=4, H=16, HV=16, K=128, V=128, allow_neg_eigval=True)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA JIT kernel")
+    def test_allow_neg_eigval_cuda_batched_path(self):
+        """B >= 8 with an fp32 state pool routes packed decode to the CUDA
+        kernel (kda_packed_decode.covered), which scales beta separately."""
+        from sglang.kernels.ops.attention import kda_packed_decode
+
+        with unittest.mock.patch.object(
+            kda_packed_decode,
+            "kda_packed_decode",
+            wraps=kda_packed_decode.kda_packed_decode,
+        ) as cuda_decode:
+            self._check(
+                B=32,
+                H=16,
+                HV=16,
+                K=128,
+                V=128,
+                allow_neg_eigval=True,
+                state_dtype=torch.float32,
+            )
+        self.assertEqual(cuda_decode.call_count, 1)
 
     def test_pad_slot(self):
         """Entries with state_idx == -1 must produce zero output and skip state writeback."""

@@ -203,6 +203,7 @@ class KimiDeltaAttention(nn.Module):
         reduce_results: bool = True,
         shard_on_attn_tp: bool = False,
         v_head_dim: Optional[int] = None,
+        allow_neg_eigval: bool = False,
         **kwargs,
     ) -> None:
         """Kimi Delta Attention.
@@ -220,6 +221,7 @@ class KimiDeltaAttention(nn.Module):
         shard_on_attn_tp: shard on the attention-TP group instead of the global
             TP group. Required under DP attention, where attn_tp_size < tp_size.
         v_head_dim: asymmetric value head dim; defaults to the key head dim.
+        allow_neg_eigval: beta = 2 * sigmoid(b), spanning (0, 2) (Solar Open 2).
         """
         super().__init__()
         self.tp_size = get_parallel().tp_size
@@ -247,6 +249,7 @@ class KimiDeltaAttention(nn.Module):
         self.prefix = prefix
         self.safe_gate = safe_gate
         self.lower_bound = lower_bound if safe_gate else None
+        self.allow_neg_eigval = allow_neg_eigval
         self.local_num_heads = _get_kda_local_num_heads(
             self.num_heads, self.shard_tp_size
         )
@@ -444,6 +447,7 @@ class KimiDeltaAttention(nn.Module):
             A_log=self.A_log,
             dt_bias=self.dt_bias,
             lower_bound=self.lower_bound,
+            allow_neg_eigval=self.allow_neg_eigval,
         )
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor):

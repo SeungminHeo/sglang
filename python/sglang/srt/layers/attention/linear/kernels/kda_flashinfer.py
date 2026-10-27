@@ -88,6 +88,8 @@ def build_fused_accept_indices(
 class FlashInferKDAKernel(LinearAttnKernelBase):
     """FlashInfer KDA kernel: decode + MTP (target_verify), topk=1."""
 
+    supports_allow_neg_eigval: bool = True
+
     def __init__(self):
         available, self._recurrent_kda = _get_flashinfer_kda_kernel()
         if not available or self._recurrent_kda is None:
@@ -164,11 +166,14 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         return A_log_fi, dt_bias_fi
 
     @staticmethod
-    def _beta_logit_to_prob(b: torch.Tensor) -> torch.Tensor:
+    def _beta_logit_to_prob(b: torch.Tensor, allow_neg_eigval: bool) -> torch.Tensor:
         # Triton KDA does beta = sigmoid(b); recurrent_kda wants beta pre-sigmoided.
         # torch.sigmoid computes in fp32 internally, so a single sigmoid on the bf16
         # logit is enough (avoids an explicit fp32 upcast + downcast = 2 extra kernels).
-        return torch.sigmoid(b).to(torch.bfloat16)
+        beta = torch.sigmoid(b)
+        if allow_neg_eigval:
+            beta = beta * 2.0  # exact in bf16
+        return beta.to(torch.bfloat16)
 
     # ---- decode ----
 
@@ -186,6 +191,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         lower_bound: Optional[float] = None,
+        allow_neg_eigval: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         batch_size = cache_indices.shape[0]
@@ -213,7 +219,9 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         key_fi = k.reshape(1, batch_size, num_heads, head_k_dim).to(torch.bfloat16)
         value_fi = v.reshape(1, batch_size, num_v_heads, head_v_dim).to(torch.bfloat16)
         g_fi = a.reshape(1, batch_size, num_v_heads, head_k_dim).to(torch.bfloat16)
-        beta_fi = self._beta_logit_to_prob(b).reshape(1, batch_size, num_v_heads)
+        beta_fi = self._beta_logit_to_prob(b, allow_neg_eigval).reshape(
+            1, batch_size, num_v_heads
+        )
 
         A_log_fi, dt_bias_fi = self._prep_gate_params(A_log, dt_bias)
 
@@ -259,6 +267,7 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         cache_steps: int,
         retrieve_parent_token: torch.Tensor,
         lower_bound: Optional[float] = None,
+        allow_neg_eigval: bool = False,
         fused_accept_state_indices: Optional[torch.Tensor] = None,
         fused_accept_num_accepted: Optional[torch.Tensor] = None,
         **kwargs,
@@ -284,7 +293,9 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         k_fi = k.reshape(1, seq_len, num_heads, head_k_dim).to(torch.bfloat16)
         v_fi = v.reshape(1, seq_len, num_v_heads, head_v_dim).to(torch.bfloat16)
         g_fi = a.reshape(1, seq_len, num_v_heads, head_k_dim).to(torch.bfloat16)
-        beta_fi = self._beta_logit_to_prob(b).reshape(1, seq_len, num_v_heads)
+        beta_fi = self._beta_logit_to_prob(b, allow_neg_eigval).reshape(
+            1, seq_len, num_v_heads
+        )
 
         A_log_fi, dt_bias_fi = self._prep_gate_params(A_log, dt_bias)
 

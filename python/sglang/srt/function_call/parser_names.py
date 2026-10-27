@@ -43,6 +43,7 @@ TOOL_CALL_PARSER_NAMES = [
     "minimax-m2",
     "minimax-m3",
     "nanbeige",
+    "solar_open2",
     "trinity",
     "interns1",
     "hermes",

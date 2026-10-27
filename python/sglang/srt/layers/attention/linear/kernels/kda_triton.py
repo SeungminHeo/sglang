@@ -33,6 +33,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
     supports_packed_decode: bool = not is_cpu() and not is_npu() and not is_xpu()
     supports_fused_chain_verify: bool = not is_cpu() and not is_npu()
     supports_track_state_snapshot: bool = True
+    supports_allow_neg_eigval: bool = True
 
     def packed_decode(
         self,
@@ -48,6 +49,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         num_v_heads: int,
         head_v_dim: int,
         lower_bound: Optional[float] = None,
+        allow_neg_eigval: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         """Packed decode fast path: feed the conv-1d output ``mixed_qkv``
@@ -82,6 +84,11 @@ class TritonKDAKernel(LinearAttnKernelBase):
                 raise NotImplementedError(
                     "KDA safe gate (lower_bound) is not implemented in the "
                     "ReplaySSM decode kernel; disable --enable-linear-replayssm."
+                )
+            if allow_neg_eigval:
+                raise NotImplementedError(
+                    "KDA allow_neg_eigval is not implemented in the ReplaySSM "
+                    "decode kernel; disable --enable-linear-replayssm."
                 )
             K = ssm_states.shape[-1]  # ssm_states: [num_slots, HV, V, K]
             fused_recurrent_linear_replayssm_decode(
@@ -122,6 +129,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             ssm_state_indices=cache_indices,
             use_qk_l2norm_in_kernel=True,
             lower_bound=lower_bound,
+            allow_neg_eigval=allow_neg_eigval,
         )
         # [B, 1, HV, V] -> [1, B, HV, V] view to match existing decode layout.
         return out.transpose(0, 1)
@@ -140,6 +148,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         lower_bound: Optional[float] = None,
+        allow_neg_eigval: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         return fused_sigmoid_gating_delta_rule_update(
@@ -158,6 +167,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             softplus_threshold=20.0,
             is_kda=True,
             lower_bound=lower_bound,
+            allow_neg_eigval=allow_neg_eigval,
         )
 
     def target_verify(
@@ -178,6 +188,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         cache_steps: int,
         retrieve_parent_token: Optional[torch.Tensor],
         lower_bound: Optional[float] = None,
+        allow_neg_eigval: bool = False,
         # fused ReplaySSM ring-write (dense verify only; off elsewhere).
         cache_ring: bool = False,
         replayssm_rawv: Optional[torch.Tensor] = None,
@@ -213,6 +224,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
             lower_bound=lower_bound,
+            allow_neg_eigval=allow_neg_eigval,
             cache_ring=cache_ring,
             replayssm_rawv=replayssm_rawv,
             replayssm_rawk=replayssm_rawk,

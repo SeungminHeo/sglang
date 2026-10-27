@@ -23,6 +23,9 @@ class LinearAttnKernelBase(ABC):
     # tracked batches loudly (NotImplementedError) keep the default False.
     supports_track_state_snapshot: bool = False
 
+    # KDA beta = 2 * sigmoid(b) (Solar Open 2) in decode / target_verify.
+    supports_allow_neg_eigval: bool = False
+
     @abstractmethod
     def decode(
         self,

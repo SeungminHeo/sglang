@@ -24,6 +24,7 @@ from sglang.srt.configs import (
     Qwen3_5Config,
     Qwen3_5MoeConfig,
     Qwen3NextConfig,
+    SolarOpen2Config,
     ZayaConfig,
 )
 from sglang.srt.utils.hf_transformers.common import get_hf_text_config
@@ -110,7 +111,7 @@ def mamba2_config(model_config: ModelConfig):
 
 def kimi_linear_config(model_config: ModelConfig):
     config = model_config.hf_config
-    if isinstance(config, KimiLinearConfig):
+    if isinstance(config, KimiLinearConfig | SolarOpen2Config):
         return config
     if isinstance(config, BailingHybridConfig) and config.use_kda:
         return config

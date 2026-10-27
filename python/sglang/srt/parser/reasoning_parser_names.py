@@ -28,6 +28,7 @@ REASONING_PARSER_NAMES = [
     "minimax-append-think",
     "minimax-m3",
     "nanbeige",
+    "solar_open2",
     "step3",
     "step3p5",
     "mistral",

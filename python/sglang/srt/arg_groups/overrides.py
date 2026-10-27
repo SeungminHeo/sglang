@@ -369,6 +369,7 @@ def _step3p_overrides(server_args: Any, hf_config: Any) -> dict:
 _MAMBA_RADIX_CACHE_ARCHS = frozenset(
     {
         "KimiLinearForCausalLM",
+        "SolarOpen2ForCausalLM",
         "KimiK3ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
         "BailingMoeV3ForCausalLM",
@@ -403,6 +404,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
 _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
     {
         "KimiLinearForCausalLM",
+        "SolarOpen2ForCausalLM",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         # Text-only entries of the same hybrid stack (models/qwen3_5_text.py);

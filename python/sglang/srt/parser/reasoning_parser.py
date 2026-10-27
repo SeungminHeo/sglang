@@ -614,6 +614,41 @@ class K2V3Detector(BaseReasoningFormatDetector):
         )
 
 
+class SolarOpen2Detector(BaseReasoningFormatDetector):
+    """Reasoning detector for Solar Open 2.
+
+    The template prefills ``<|think:start|>`` when ``reasoning_effort`` is
+    medium/high/xhigh or unset (it defaults to high), so the output starts
+    inside reasoning; any other effort prefills the closed pair and the output
+    is content only. The request's effort, not ``force_reasoning``, decides.
+    """
+
+    _THINKING_EFFORTS = ("medium", "high", "xhigh")
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+        reasoning_effort: object = None,
+    ):
+        super().__init__(
+            "<|think:start|>",
+            "<|think:end|>",
+            force_reasoning=(
+                reasoning_effort is None or reasoning_effort in self._THINKING_EFFORTS
+            ),
+            stream_reasoning=stream_reasoning,
+            # The model sometimes calls a tool before closing its think block.
+            tool_start_token="<|tool_call:start|>",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
+        )
+
+
 class KimiK3Detector(BaseReasoningFormatDetector):
     """Detector for the Kimi K3 XTML think channel.
 
@@ -2296,6 +2331,7 @@ class ReasoningParser:
         "poolside_v1": _PoolsideV1Detector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
+        "solar_open2": SolarOpen2Detector,
         "minimax": Qwen3Detector,
         "minimax-append-think": MiniMaxAppendThinkDetector,
         "minimax-m3": MiniMaxM3Detector,
@@ -2375,7 +2411,7 @@ class ReasoningParser:
             if chat_template_kwargs.get("enable_thinking") is False:
                 kwargs["force_nonempty_content"] = True
 
-        if model_type.lower() == "k2_horizon":
+        if model_type.lower() in ("k2_horizon", "solar_open2"):
             # Template kwargs are the final values passed to Jinja and therefore
             # take precedence over the convenience fields on API requests.
             effort = chat_template_kwargs.get("reasoning_effort")

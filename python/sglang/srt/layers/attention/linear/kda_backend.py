@@ -300,6 +300,9 @@ class KDAKernelDispatcher:
         kernel does not support packed decode."""
         if not self.supports_packed_decode:
             return None
+        self._check_allow_neg_eigval(
+            self.decode_kernel, kwargs.get("allow_neg_eigval", False)
+        )
         return self.decode_kernel.packed_decode(
             mixed_qkv,
             a,
@@ -337,6 +340,9 @@ class KDAKernelDispatcher:
                 f"lower_bound (safe gate) is only supported by TritonKDAKernel; "
                 f"got {self.decode_kernel.__class__.__name__}."
             )
+        self._check_allow_neg_eigval(
+            self.decode_kernel, kwargs.get("allow_neg_eigval", False)
+        )
         return self.decode_kernel.decode(
             q,
             k,
@@ -382,6 +388,9 @@ class KDAKernelDispatcher:
                 "lower_bound (safe gate) target verify is not supported by "
                 f"{self.verify_kernel.__class__.__name__}."
             )
+        self._check_allow_neg_eigval(
+            self.verify_kernel, kwargs.get("allow_neg_eigval", False)
+        )
         return self.verify_kernel.target_verify(
             A_log=A_log,
             dt_bias=dt_bias,
@@ -417,6 +426,17 @@ class KDAKernelDispatcher:
             kernel = self.triton_kernel
         return kernel
 
+    @staticmethod
+    def _check_allow_neg_eigval(kernel, allow_neg_eigval: bool) -> None:
+        # Decode kernels that sigmoid beta in-kernel would drop the 2x scale; other
+        # prefill kernels are unvalidated for beta in (0, 2) (CuTe DSL gave wrong output).
+        if allow_neg_eigval and not kernel.supports_allow_neg_eigval:
+            raise NotImplementedError(
+                "KDA allow_neg_eigval (beta = 2 * sigmoid(b)) is only supported "
+                "by the triton kernels (decode, verify, prefill) and the "
+                f"flashinfer decode/verify kernels; got {kernel.__class__.__name__}."
+            )
+
     def extend(
         self,
         q: torch.Tensor,
@@ -433,6 +453,7 @@ class KDAKernelDispatcher:
         kernel = self.effective_extend_kernel(
             kwargs.get("lower_bound"), q.shape[1], query_start_loc.numel() - 1
         )
+        self._check_allow_neg_eigval(kernel, kwargs.pop("allow_neg_eigval", False))
         return kernel.extend(
             q,
             k,
@@ -982,6 +1003,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 num_v_heads=layer.num_v_heads,
                 head_v_dim=layer.head_v_dim,
                 lower_bound=layer.lower_bound,
+                allow_neg_eigval=layer.allow_neg_eigval,
                 replayssm_d=replayssm_d,
                 replayssm_k=replayssm_k,
                 replayssm_g=replayssm_g,
@@ -1010,6 +1032,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
             lower_bound=layer.lower_bound,
+            allow_neg_eigval=layer.allow_neg_eigval,
         )
 
         self._track_mamba_state_decode(
@@ -1163,6 +1186,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 dtype=torch.float32,
                 device=ssm_states.device,
             )
+        if layer.allow_neg_eigval:
+            # beta = 2 * sigmoid(b); raw-beta extend kernels would apply only the sigmoid.
+            b = b.float().sigmoid() * 2.0
         core_attn_out = self.kernel_dispatcher.extend(
             q=q,
             k=k,
@@ -1175,7 +1201,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             lower_bound=layer.lower_bound,
-            beta_is_raw=True,
+            allow_neg_eigval=layer.allow_neg_eigval,
+            # allow_neg_eigval layers hand in beta already activated (see above).
+            beta_is_raw=not layer.allow_neg_eigval,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             layer_id=layer.layer_id,
@@ -1464,6 +1492,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             cache_steps=draft_token_num,
             retrieve_parent_token=retrieve_parent_token,
             lower_bound=layer.lower_bound,
+            allow_neg_eigval=layer.allow_neg_eigval,
             **ring_kwargs,
             **(
                 dict(
@@ -1512,6 +1541,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_beta: Optional[torch.Tensor],
     ) -> bool:
         if self._fused_chain_verify_fn is None or not mixed_qkv.is_cuda:
+            return False
+        if layer.allow_neg_eigval:
             return False
         if any(
             value is not None

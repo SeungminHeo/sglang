@@ -96,11 +96,12 @@ def kda_packed_decode(
     ssm_state_indices: torch.Tensor,
     num_q_heads: int,
     lower_bound: Optional[float] = None,
+    allow_neg_eigval: bool = False,
 ) -> None:
     """In-place KDA decode step: updates `initial_state` rows selected by
     `ssm_state_indices` and writes attention output into `out` ([B, 1, HV, V]).
     Caller must have checked covered(); q/k l2-norm is always applied
-    (matches the production dispatch)."""
+    (matches the production dispatch). allow_neg_eigval doubles beta."""
     B = mixed_qkv.shape[0]
     HV, V, _ = initial_state.shape[-3:]
     state = initial_state.view(-1, *initial_state.shape[-3:])
@@ -116,5 +117,6 @@ def kda_packed_decode(
         float(scale),
         float(lower_bound) if lower_bound is not None else 0.0,
         lower_bound is not None,
+        2.0 if allow_neg_eigval else 1.0,
         int(num_q_heads),
     )

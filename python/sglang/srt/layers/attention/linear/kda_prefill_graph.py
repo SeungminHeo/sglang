@@ -368,6 +368,14 @@ def kda_extend_in_graph(
             dtype=torch.float32,
             device=ssm_states.device,
         )
+    if layer.allow_neg_eigval:
+        if meta.flashinfer is not None:
+            raise NotImplementedError(
+                "KDA allow_neg_eigval is not supported by the FlashInfer prefill "
+                "graph kernel; use --linear-attn-prefill-backend triton."
+            )
+        # beta = 2 * sigmoid(b); raw-beta extend kernels would apply only the sigmoid.
+        b = b.float().sigmoid() * 2.0
     if meta.flashinfer is not None:
         core_attn_out = meta.flashinfer.run(
             layer=layer,
@@ -392,7 +400,8 @@ def kda_extend_in_graph(
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             lower_bound=layer.lower_bound,
-            beta_is_raw=True,
+            allow_neg_eigval=layer.allow_neg_eigval,
+            beta_is_raw=not layer.allow_neg_eigval,
             extend_seq_lens_cpu=None,
             is_spec_decode=False,
             return_intermediate_states=False,
