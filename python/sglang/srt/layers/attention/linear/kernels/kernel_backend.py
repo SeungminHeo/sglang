@@ -12,6 +12,8 @@ class LinearAttnKernelBase(ABC):
 
     uses_state_checkpoints: bool = False
     supports_fused_chain_verify: bool = False
+    # KDA beta = 2 * sigmoid(b) (Solar Open 2) in decode / target_verify.
+    supports_allow_neg_eigval: bool = False
 
     @abstractmethod
     def decode(

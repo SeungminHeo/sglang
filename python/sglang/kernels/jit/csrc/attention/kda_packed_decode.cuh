@@ -9,8 +9,8 @@
 // warp - the kernel has no __syncthreads at all.
 //
 // Math follows the triton kernel exactly (fp32 throughout, same op order):
-//   h *= exp(g);  t = <h, k>;  v = (v - t) * sigmoid(b);  h += v * k;
-//   o = <h, q>
+//   h *= exp(g);  t = <h, k>;  v = (v - t) * beta_scale * sigmoid(b);
+//   h += v * k;  o = <h, q>
 // with g = -exp(A_log) * softplus(a + dt_bias) (K3: no lower bound) or
 // lower_bound * sigmoid(exp(A_log) * (a + dt_bias)). Warp-shuffle reduction
 // order differs from tl.sum, so outputs match to ULPs, not bits (validated
@@ -46,6 +46,7 @@ struct KdaPackedDecodeParams {
   fp32_t scale;
   fp32_t lower_bound;
   int32_t use_lower_bound;
+  fp32_t beta_scale;  // 2 for allow_neg_eigval (beta in (0, 2)), else 1
 };
 
 __device__ __forceinline__ float warp_allreduce_sum(float v) {
@@ -126,7 +127,7 @@ __launch_bounds__(kWarps * 32) void kda_packed_decode_kernel(const KdaPackedDeco
     }
     decay[e] = expf(g);
   }
-  const float beta = 1.0f / (1.0f + expf(-cast<fp32_t>(params.b[n * params.stride_b + hv])));
+  const float beta = params.beta_scale / (1.0f + expf(-cast<fp32_t>(params.b[n * params.stride_b + hv])));
 
   const bf16_t* v_ptr = mixed + 2 * params.H * K + hv * V;
   fp32_t* h_base = params.state + sidx * params.stride_state + static_cast<int64_t>(hv) * V * K;
@@ -177,6 +178,7 @@ struct KdaPackedDecodeKernel {
       double scale,
       double lower_bound,
       bool use_lower_bound,
+      double beta_scale,
       int64_t num_q_heads) {
     using namespace host;
 
@@ -231,6 +233,7 @@ struct KdaPackedDecodeKernel {
         .scale = static_cast<fp32_t>(scale),
         .lower_bound = static_cast<fp32_t>(lower_bound),
         .use_lower_bound = use_lower_bound ? 1 : 0,
+        .beta_scale = static_cast<fp32_t>(beta_scale),
     };
 
     LaunchKernel(B * HV, kWarps * 32, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);

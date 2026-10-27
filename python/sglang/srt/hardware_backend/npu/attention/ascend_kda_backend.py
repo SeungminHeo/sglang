@@ -112,6 +112,14 @@ class _AscendKDAExtendKernel:
         return out
 
 
+def _reject_allow_neg_eigval(layer: RadixLinearAttention) -> None:
+    if layer.allow_neg_eigval:
+        raise NotImplementedError(
+            "KDA allow_neg_eigval (beta = 2 * sigmoid(b)) is not supported by "
+            "the Ascend KDA backend."
+        )
+
+
 class AscendKDAAttnBackend(KDAAttnBackend):
     """Ascend implementation of Kimi Delta Attention.
 
@@ -175,6 +183,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
     ):
         """Run KDA decode against the native channel-first Ascend cache."""
         assert isinstance(mixed_qkv, torch.Tensor)
+        _reject_allow_neg_eigval(layer)
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
@@ -260,6 +269,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
     ):
         """Run Ascend prefill without changing the shared KDA backend."""
         assert isinstance(mixed_qkv, torch.Tensor)
+        _reject_allow_neg_eigval(layer)
         if forward_batch.forward_mode.is_target_verify():
             return self._forward_target_verify(layer, forward_batch, mixed_qkv, a, b)
 
@@ -365,6 +375,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         b: torch.Tensor,
     ) -> torch.Tensor:
         """Run fixed-width DSpark verify with Ascend-native state snapshots."""
+        _reject_allow_neg_eigval(layer)
         metadata = self.forward_metadata
         seq_len = mixed_qkv.shape[0]
         query_start_loc = metadata.query_start_loc

@@ -52,6 +52,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     IS_VARLEN: tl.constexpr,
     IS_KDA: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    ALLOW_NEG_EIGVAL: tl.constexpr = False,
     # Optional flags for target_verify support (default False for decode)
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
@@ -215,8 +216,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             )
             b_g = -tl.exp(b_A_log) * softplus_x
 
-        # Compute beta = sigmoid(b)
+        # Compute beta = sigmoid(b), or 2 * sigmoid(b) when beta spans (0, 2)
         b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+        if ALLOW_NEG_EIGVAL:
+            b_beta = b_beta * 2.0
 
         # fused ring-write: stash this step's raw inputs + in-kernel gate/beta
         # into the per-slot ring for the commit fold to replay. Must sit here --
@@ -363,6 +366,7 @@ def fused_sigmoid_gating_delta_rule_update(
     cu_seqlens: Optional[torch.Tensor] = None,
     is_kda: bool = False,
     lower_bound: Optional[float] = None,
+    allow_neg_eigval: bool = False,
     # Optional parameters for target_verify support
     disable_state_update: bool = False,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
@@ -510,6 +514,7 @@ def fused_sigmoid_gating_delta_rule_update(
         IS_VARLEN=cu_seqlens is not None,
         IS_KDA=is_kda,
         USE_LOWER_BOUND=lower_bound is not None,
+        ALLOW_NEG_EIGVAL=allow_neg_eigval,
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,

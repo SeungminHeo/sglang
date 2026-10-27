@@ -56,6 +56,8 @@ class RadixLinearAttention(nn.Module):
         A_log: Optional[torch.Tensor] = None,
         dt_bias: Optional[torch.Tensor] = None,
         lower_bound: Optional[float] = None,
+        # KDA beta = 2 * sigmoid(b); the model pre-activates beta for extend.
+        allow_neg_eigval: bool = False,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -76,6 +78,7 @@ class RadixLinearAttention(nn.Module):
         self.A_log = A_log
         self.dt_bias = dt_bias
         self.lower_bound = lower_bound
+        self.allow_neg_eigval = allow_neg_eigval
 
     def forward(
         self,

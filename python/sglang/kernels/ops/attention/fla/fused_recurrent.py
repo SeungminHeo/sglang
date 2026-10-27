@@ -431,6 +431,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    ALLOW_NEG_EIGVAL: tl.constexpr,
 ):
     """KDA packed decode: same shape as the GDN packed decode kernel, but
     with a per-K gate (``a`` is ``[B, HV*K]`` and ``dt_bias`` is ``[HV*K]``),
@@ -491,6 +492,8 @@ def fused_recurrent_kda_packed_decode_kernel(
     # kernel `fused_sigmoid_gating_delta_rule_update`, which is the reference
     # validated against torch.
     beta_val = tl.sigmoid(b_val).to(tl.float32)
+    if ALLOW_NEG_EIGVAL:
+        beta_val = beta_val * 2.0
 
     # Per-K decay: each K-row of the [V, K] state decays by its own exp(g_k).
     b_h *= exp(b_g)[None, :]
@@ -517,6 +520,7 @@ def fused_recurrent_kda_packed_decode(
     ssm_state_indices: torch.Tensor,
     use_qk_l2norm_in_kernel: bool = False,
     lower_bound: Optional[float] = None,
+    allow_neg_eigval: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """KDA T=1 decode fast path. Mirrors ``fused_recurrent_gated_delta_rule_packed_decode``
     but the gate ``g`` is a per-K vector instead of a scalar.
@@ -535,6 +539,7 @@ def fused_recurrent_kda_packed_decode(
         use_qk_l2norm_in_kernel: apply per-head L2 norm to Q/K inside the kernel.
         lower_bound: enable KDA safe gate when set, matching
             ``fused_sigmoid_gating_delta_rule_update``.
+        allow_neg_eigval: use ``beta = 2 * sigmoid(b)`` so beta spans (0, 2).
     """
     if mixed_qkv.ndim != 2:
         raise ValueError(
@@ -654,6 +659,7 @@ def fused_recurrent_kda_packed_decode(
                 ssm_state_indices,
                 H,
                 lower_bound,
+                allow_neg_eigval,
             )
             return out, initial_state
 
@@ -702,6 +708,7 @@ def fused_recurrent_kda_packed_decode(
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         USE_LOWER_BOUND=lower_bound is not None,
+        ALLOW_NEG_EIGVAL=allow_neg_eigval,
         num_warps=num_warps,
         num_stages=num_stages,
     )
