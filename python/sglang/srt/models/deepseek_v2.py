@@ -407,6 +407,12 @@ class DeepseekV2MLP(nn.Module):
                 self.swiglu_limit is not None
                 or self.down_proj.weight.dtype == torch.float8_e4m3fn
             )
+            # The transposed UE8M0 scale layout packs 4 groups of 128 per int32
+            # (e.g. a 2048-wide shared expert at TP8 has only 2 groups).
+            and (
+                not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                or (gate_up.shape[1] // 2) % (4 * 128) == 0
+            )
         ):
             M, N = gate_up.shape
             down_input_fp8 = gate_up.new_empty((M, N // 2), dtype=torch.float8_e4m3fn)
