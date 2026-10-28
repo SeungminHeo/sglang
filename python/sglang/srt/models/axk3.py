@@ -13,13 +13,14 @@
 # ==============================================================================
 """Inference-only SKT A.X-K3 family (AXK3ForCausalLM) on the A.X-K2 port.
 
-A.X-K3 is A.X-K2 with two additions, both switched on by config flags of an
-``axk2`` checkpoint (see ``configs/axk3.py``, which routes it here):
+A.X-K3 is A.X-K2 with two additions, both switched on by config flags (see
+``configs/axk3.py`` for the ``axk2`` and ``axk3`` checkpoint encodings):
 
-1. Index share (``dsa_index_share``): only the ``full_attention`` layers run
-   the DSA indexer; each ``sliding_attention`` layer reuses the top-k of the
-   full layer before it. The config resolution turns ``layer_types`` into
-   ``index_topk_pattern``, which the DeepSeek DSA attention already serves.
+1. Index share: only some layers run the DSA indexer; the others reuse the
+   top-k of the indexer layer before them. ``axk2`` checkpoints mark them
+   ``sliding_attention`` in ``layer_types`` (resolved to
+   ``index_topk_pattern``), ``axk3`` ones with ``index_topk_freq`` /
+   ``index_skip_topk_offset``; the DeepSeek DSA attention serves both.
 2. Gated residual (``gated_residual``, A.X-K3 Flash): the residual stream is
    widened to ``n`` copies of the hidden state. Each sublayer reads its input
    as a gated mix of the per-branch-normalized streams and writes its output

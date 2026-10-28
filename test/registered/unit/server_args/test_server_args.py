@@ -3327,6 +3327,7 @@ class TestDeepEPv2Args(CustomTestCase):
             "Glm5NextForConditionalGeneration",
             "MiMoV2ForCausalLM",
             "MiMoV2FlashForCausalLM",
+            "AXK3ForCausalLM",
         ):
             args = self._args(moe_runner_backend="deep_gemm")
             args._model_config.hf_config.architectures = [architecture]

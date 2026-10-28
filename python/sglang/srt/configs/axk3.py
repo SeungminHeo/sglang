@@ -13,35 +13,40 @@
 # ==============================================================================
 """Config resolution for SKT A.X-K3 checkpoints.
 
-A.X-K3 checkpoints ship as ``model_type: axk2`` / ``AXK2ForCausalLM`` and turn
-on their additions with config flags: ``dsa_index_share`` (layers typed
-``sliding_attention`` reuse the top-k of the preceding full layer's indexer)
-and ``gated_residual`` (a widened residual stream replaces the pre-norms).
+A.X-K3 checkpoints come in two encodings of the same model:
+
+- ``model_type: axk2`` / ``AXK2ForCausalLM`` with K3 config flags:
+  ``dsa_index_share`` (layers typed ``sliding_attention`` reuse the top-k of
+  the preceding full layer's indexer) and ``gated_residual``.
+- ``model_type: axk3`` / ``AXK3ForCausalLM``, which writes the index share as
+  Megatron's ``index_topk_freq`` / ``index_skip_topk_offset`` (the rule
+  ``dsa_layer_skips_topk`` already reads) and drops ``layer_types``.
 """
 
 AXK3_ARCH = "AXK3ForCausalLM"
+_AXK3_MODEL_TYPE = "axk3"
 _SLIDING_ATTENTION = "sliding_attention"
 
 
 def is_axk3_config(config) -> bool:
-    return bool(
+    return config.model_type == _AXK3_MODEL_TYPE or bool(
         getattr(config, "dsa_index_share", False)
         or getattr(config, "gated_residual", False)
     )
 
 
 def resolve_axk3_config(config) -> None:
-    """Derive ``index_topk_pattern`` and route the config to AXK3ForCausalLM.
+    """Derive the shared top-k layout and route the config to AXK3ForCausalLM.
 
-    The pattern is what the DSA attention, the KV pool and HiSparse read to
-    tell full ("F") from top-k-sharing ("S") layers, so it has to be set at
-    config load, before any of them is built.
+    The layout is what the DSA attention, the KV pool and HiSparse read to
+    tell full from top-k-sharing layers, so it has to be set at config load,
+    before any of them is built.
     """
     if not is_axk3_config(config):
         return
     _reject_unsupported(config)
     layer_types = getattr(config, "layer_types", None)
-    if config.dsa_index_share and layer_types is not None:
+    if getattr(config, "dsa_index_share", False) and layer_types is not None:
         if layer_types[0] == _SLIDING_ATTENTION:
             raise ValueError(
                 "A.X-K3 layer 0 is a sliding_attention layer, which has no "
@@ -51,10 +56,18 @@ def resolve_axk3_config(config) -> None:
             "S" if layer_type == _SLIDING_ATTENTION else "F"
             for layer_type in layer_types
         )
+    elif getattr(config, "index_topk_freq", None) is not None:
+        # Megatron and the axk3 HF config clamp the offset to >= 1, which
+        # dsa_layer_skips_topk asserts instead.
+        config.index_skip_topk_offset = max(
+            getattr(config, "index_skip_topk_offset", None) or 0, 1
+        )
     config.architectures = [AXK3_ARCH]
 
 
 def _reject_unsupported(config) -> None:
+    if not getattr(config, "use_dsa", True):
+        raise ValueError("A.X-K3 without DSA (use_dsa=false) is not supported.")
     if getattr(config, "softmax_type", "vanilla") != "vanilla":
         raise ValueError(
             f"A.X-K3 softmax_type={config.softmax_type!r} (learnable attention "
@@ -81,3 +94,11 @@ def _reject_unsupported(config) -> None:
         final = getattr(config, "gated_residual_final", "gated_read")
         if final != "gated_read":
             raise ValueError(f"A.X-K3 gated_residual_final={final!r} is not supported.")
+        # 1-based; later values keep plain pre-norm layers below the gated
+        # residual (the K3 688B layout).
+        first_layer = getattr(config, "gated_residual_first_layer", None) or 1
+        if first_layer != 1:
+            raise ValueError(
+                f"A.X-K3 gated_residual_first_layer={first_layer} is not "
+                "supported; only a gated residual on every layer is."
+            )

@@ -237,8 +237,8 @@ try:
     # SKT A.X-K2 is a DeepSeek-V3.2 derivative; the alias keeps the config
     # json-faithful (native transformers AXK2Config replaces
     # first_k_dense_replace/moe_layer_freq with mlp_layer_types, which the
-    # DeepSeek model code does not read). A.X-K3 checkpoints share the axk2
-    # model_type and are routed to AXK3ForCausalLM by their config flags.
+    # DeepSeek model code does not read). A.X-K3 checkpoints ship either as
+    # axk2 with K3 config flags or as axk3; both resolve to AXK3ForCausalLM.
     class _AXK2ConfigAlias(_HFDeepseekV3Config):
         model_type = "axk2"
 
@@ -248,7 +248,11 @@ try:
 
             resolve_axk3_config(self)
 
+    class _AXK3ConfigAlias(_AXK2ConfigAlias):
+        model_type = "axk3"
+
     _CONFIG_REGISTRY["axk2"] = _AXK2ConfigAlias
+    _CONFIG_REGISTRY["axk3"] = _AXK3ConfigAlias
 except ImportError:
     pass
 

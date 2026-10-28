@@ -67,7 +67,7 @@ from sglang.srt.runtime_context import get_parallel  # noqa: E402
 from sglang.srt.utils.hf_transformers.common import _CONFIG_REGISTRY  # noqa: E402
 
 
-def _tiny_axk2_config(**overrides):
+def _tiny_axk2_config(model_type="axk2", **overrides):
     fields = dict(
         vocab_size=128,
         hidden_size=64,
@@ -99,7 +99,7 @@ def _tiny_axk2_config(**overrides):
         scoring_func="sigmoid",
     )
     fields.update(overrides)
-    return _CONFIG_REGISTRY["axk2"](**fields)
+    return _CONFIG_REGISTRY[model_type](**fields)
 
 
 class TestAXK2Registration(CustomTestCase):
@@ -581,6 +581,40 @@ class TestAXK3Config(CustomTestCase):
         # Sliding layers run as top-k consumers over the whole context only.
         with self.assertRaisesRegex(ValueError, "swa_window_size"):
             _tiny_axk3_config(swa_window_size=128)
+
+    def test_axk3_model_type_shares_topk_like_its_checkpoint(self):
+        """A.X-K3-Flash_Preview_SFT_FP8_Blockwise (model_type axk3, freq 4,
+        offset 1) carries indexer weights on layers 0, 4, ..., 28 only; every
+        other layer must reuse a top-k instead of building an indexer."""
+        fields = dict(
+            num_hidden_layers=32,
+            architectures=["AXK3ForCausalLM"],
+            first_k_dense_replace=0,
+            gated_residual=True,
+            gated_residual_num_streams=2,
+            gated_residual_rank=4,
+            gated_residual_first_layer=1,
+            attention_output_gate=True,
+            gated_norm=False,
+            use_dsa=True,
+            index_topk_freq=4,
+            index_skip_topk_offset=1,
+        )
+        config = _tiny_axk2_config(model_type="axk3", **fields)
+        self.assertEqual(config.architectures, ["AXK3ForCausalLM"])
+        self.assertEqual(
+            [i for i in range(32) if not dsa_layer_skips_topk(config, i)],
+            list(range(0, 32, 4)),
+        )
+        # The HF config clamps offset 0 to 1; layer 0 must still run its indexer.
+        fields["index_skip_topk_offset"] = 0
+        config = _tiny_axk2_config(model_type="axk3", **fields)
+        self.assertFalse(dsa_layer_skips_topk(config, 0))
+
+    def test_plain_norm_layers_below_the_gated_residual_are_rejected(self):
+        # The K3 688B layout (gated_residual_first_layer=2) is not implemented.
+        with self.assertRaisesRegex(ValueError, "gated_residual_first_layer"):
+            _tiny_axk3_config(gated_residual_first_layer=2)
 
 
 class TestAXK3GatedResidualWeights(CustomTestCase):
