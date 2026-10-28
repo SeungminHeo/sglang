@@ -60,6 +60,7 @@ from sglang.srt.models.axk2 import (  # noqa: E402
 )
 from sglang.srt.models.axk3 import (  # noqa: E402
     AXK3ForCausalLM,
+    _contract_idle_streams,
     _remap_gated_residual_weights,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer  # noqa: E402
@@ -703,6 +704,17 @@ class TestAXK3GatedResidualWeights(CustomTestCase):
         weights = [("model.layers.0.attn_gated_residual.write_bias", torch.ones(2))]
         with self.assertRaises(NotImplementedError):
             list(_remap_gated_residual_weights(weights))
+
+
+class TestAXK3IdleRankOutput(CustomTestCase):
+    def test_idle_rank_hands_the_lm_head_hidden_size_rows(self):
+        """With --enable-dp-lm-head an idle DP rank (no final read) still joins
+        the LM head gather; stream-wide zero rows crashed its matmul."""
+        contract = partial(_contract_idle_streams, None, None, hidden_size=8)
+        self.assertEqual(tuple(contract(torch.empty(0, 32)).shape), (0, 8))
+        # Rows that went through the final read are left alone.
+        self.assertIsNone(contract(torch.empty(3, 8)))
+        self.assertIsNone(contract(torch.empty(0, 8)))
 
 
 class TestAXK3DecoderLayerConversion(CustomTestCase):

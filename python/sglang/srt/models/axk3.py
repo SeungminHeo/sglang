@@ -200,6 +200,19 @@ def _remap_gated_residual_weights(
             yield f"{module}.{_GATED_RESIDUAL_LINEARS[leaf]}", loaded_weight
 
 
+def _contract_idle_streams(module, args, output, *, hidden_size: int):
+    """An idle DP rank skips the final norm, which is the gated read here, so
+    its zero rows stay stream-wide; with --enable-dp-lm-head it still joins
+    the LM head gather, which takes ``hidden_size``-wide rows."""
+    if (
+        isinstance(output, torch.Tensor)
+        and output.shape[0] == 0
+        and output.shape[-1] != hidden_size
+    ):
+        return output.new_empty((0, hidden_size))
+    return None
+
+
 class AXK3ForCausalLM(AXK2ForCausalLM):
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config, quant_config=quant_config, prefix=prefix)
@@ -210,6 +223,9 @@ class AXK3ForCausalLM(AXK2ForCausalLM):
                     "gated residual yet."
                 )
             self.model.norm = AXK3FinalGatedRead(_hc_config(config))
+            self.model.register_forward_hook(
+                partial(_contract_idle_streams, hidden_size=config.hidden_size)
+            )
 
     @staticmethod
     def _check_config(config) -> None:
