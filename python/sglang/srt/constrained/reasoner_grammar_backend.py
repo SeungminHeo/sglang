@@ -29,6 +29,7 @@ from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 from .base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
+    GrammarRow,
     InvalidGrammarObject,
 )
 
@@ -290,6 +291,25 @@ class ReasonerGrammarObject(BaseGrammarObject):
             return
         if self._is_generation() and self.grammar is not None:
             self.grammar.fill_vocab_mask(vocab_mask, idx)
+
+    @staticmethod
+    def fill_vocab_mask_batched(
+        entries: List[GrammarRow], vocab_mask: torch.Tensor
+    ) -> None:
+        """Hand rows past the reasoning end to the inner grammar's batched fill."""
+        inner_entries = []
+        for entry in entries:
+            wrapper = entry.grammar
+            if (
+                isinstance(wrapper, ReasonerGrammarObject)
+                and wrapper._is_generation()
+                and wrapper.grammar is not None
+            ):
+                inner_entries.append(GrammarRow(row=entry.row, grammar=wrapper.grammar))
+            else:
+                wrapper.fill_vocab_mask(vocab_mask, entry.row)
+        if inner_entries:
+            inner_entries[0].grammar.fill_vocab_mask_batched(inner_entries, vocab_mask)
 
     def allocate_vocab_mask(self, vocab_size, batch_size, device):
         if self.grammar is not None:

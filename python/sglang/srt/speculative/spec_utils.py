@@ -27,7 +27,7 @@ from sglang.kernels.ops.speculative.row_argmax import row_argmax
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.hybrid_arch import mambaish_config
-from sglang.srt.constrained.base_grammar_backend import GrammarMask
+from sglang.srt.constrained.base_grammar_backend import GrammarMask, GrammarRow
 from sglang.srt.distributed.parallel_state import (
     get_self_pp_group,
     patch_pipeline_parallel_group,
@@ -749,6 +749,71 @@ def generate_token_bitmask(
     return allocate_token_bitmask, grammar
 
 
+def _draft_allowed(vocab_mask: torch.Tensor, row: int, token: int, vocab_size: int):
+    # Same bounds as traverse_tree: a negative id would index the mask from the end.
+    if token < 0 or (vocab_size and token >= vocab_size):
+        return False
+    # 32 boolean bitmask values are packed into 32-bit integers
+    return (int(vocab_mask[row, token // 32]) >> (token % 32)) & 1 == 1
+
+
+def generate_chain_token_bitmask(
+    reqs: List[Req],
+    draft_tokens_cpu: torch.Tensor,
+    vocab_size: int,
+) -> Tuple[Optional[torch.Tensor], Optional[BaseGrammarObject]]:
+    """``generate_token_bitmask`` for linear chains, with one batched fill per position.
+
+    Fills the same rows as the per-request DFS: a position is filled iff every draft
+    before it passed its parent's mask and the grammar has not terminated.
+    """
+    grammar_reqs = [
+        (i, req.grammar) for i, req in enumerate(reqs) if req.grammar is not None
+    ]
+    if not grammar_reqs:
+        return None, None
+    bs, chain_len = draft_tokens_cpu.shape
+    assert len(reqs) == bs
+    first_grammar = grammar_reqs[0][1]
+    vocab_mask = first_grammar.allocate_vocab_mask(
+        vocab_size=vocab_size, batch_size=bs * chain_len, device="cpu"
+    )
+    draft_tokens = draft_tokens_cpu.tolist()
+    rollback_lens = [0] * bs
+
+    s = time.perf_counter()
+    live = grammar_reqs
+    for pos in range(chain_len):
+        if pos > 0:
+            next_live = []
+            for i, grammar in live:
+                token = draft_tokens[i][pos]
+                parent_row = i * chain_len + pos - 1
+                if _draft_allowed(vocab_mask, parent_row, token, vocab_size):
+                    grammar.accept_token(token)
+                    rollback_lens[i] += 1
+                    next_live.append((i, grammar))
+            live = next_live
+        live = [(i, grammar) for i, grammar in live if not grammar.is_terminated()]
+        if not live:
+            break
+        first_grammar.fill_vocab_mask_batched(
+            [GrammarRow(row=i * chain_len + pos, grammar=g) for i, g in live],
+            vocab_mask,
+        )
+    for i, grammar in grammar_reqs:
+        if rollback_lens[i] > 0:
+            grammar.rollback(rollback_lens[i])
+
+    traverse_time = time.perf_counter() - s
+    if traverse_time > TREE_TRAVERSE_TIME_THRESHOLD:
+        logger.warning(
+            f"Bit mask generation took {traverse_time} seconds for "
+            f"{len(grammar_reqs)} grammar requests"
+        )
+    return vocab_mask, first_grammar
+
+
 class GrammarTree:
     """The verify tree the grammar bitmask is built over, on the host.
 
@@ -756,9 +821,13 @@ class GrammarTree:
     launch; ``from_host`` is for algorithms that build the tree there (NGRAM).
     """
 
-    def __init__(self, host: Tuple[torch.Tensor, ...], done_event):
+    def __init__(
+        self, host: Tuple[torch.Tensor, ...], done_event, *, is_chain: bool = False
+    ):
         self._host = host
         self._done = done_event
+        # Node i's only child is i + 1 in every row; enables the batched chain fill.
+        self.is_chain = is_chain
 
     @classmethod
     def from_device(
@@ -766,6 +835,8 @@ class GrammarTree:
         retrieve_next_token: torch.Tensor,
         retrieve_next_sibling: torch.Tensor,
         draft_token: torch.Tensor,
+        *,
+        is_chain: bool = False,
     ) -> GrammarTree:
         tensors = (retrieve_next_token, retrieve_next_sibling, draft_token)
         host = tuple(_async_d2h(t) for t in tensors)
@@ -773,10 +844,10 @@ class GrammarTree:
         # the host -- so the event has to key off whichever one is on device.
         device = next((t.device for t in tensors if t.device.type != "cpu"), None)
         if device is None:
-            return cls(host, None)
+            return cls(host, None, is_chain=is_chain)
         done = torch.get_device_module(device).Event()
         done.record()
-        return cls(host, done)
+        return cls(host, done, is_chain=is_chain)
 
     @classmethod
     def from_host(
@@ -799,7 +870,7 @@ class GrammarTree:
         next_token = torch.full((bs, chain_len), -1, dtype=torch.int64)
         next_token[:, :-1] = torch.arange(1, chain_len, dtype=torch.int64)
         next_sibling = torch.full((bs, chain_len), -1, dtype=torch.int64)
-        return cls.from_device(next_token, next_sibling, verify_ids_2d)
+        return cls.from_device(next_token, next_sibling, verify_ids_2d, is_chain=True)
 
     def resolve(self) -> Tuple[torch.Tensor, ...]:
         if self._done is not None:
@@ -823,11 +894,21 @@ def build_grammar_vocab_mask(
     """
     if barrier is not None:
         barrier()
-    vocab_mask, grammar = generate_token_bitmask(
-        reqs,
-        *tree.resolve(),
-        sampling_info.vocab_size,
-    )
+    retrieve_next_token, retrieve_next_sibling, draft_tokens = tree.resolve()
+    if tree.is_chain:
+        vocab_mask, grammar = generate_chain_token_bitmask(
+            reqs=reqs,
+            draft_tokens_cpu=draft_tokens,
+            vocab_size=sampling_info.vocab_size,
+        )
+    else:
+        vocab_mask, grammar = generate_token_bitmask(
+            reqs,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            draft_tokens,
+            sampling_info.vocab_size,
+        )
     if vocab_mask is None:
         return None
 

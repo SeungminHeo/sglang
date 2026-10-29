@@ -409,6 +409,9 @@ class Envs:
     # ===================================================================
     SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
     SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
+    # Threads per scheduler for batched xgrammar mask fills; the pool's "auto"
+    # sizes off the node's cores, not the container's CPU limit.
+    SGLANG_GRAMMAR_BATCH_FILL_THREADS = EnvInt(8)
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(False)
 
     # ===================================================================

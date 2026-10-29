@@ -16,10 +16,12 @@
 import dataclasses
 import json
 import logging
+from functools import lru_cache
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 from xgrammar import (
+    BatchGrammarMatcher,
     CompiledGrammar,
     GrammarCompiler,
     GrammarMatcher,
@@ -34,6 +36,7 @@ from xgrammar import (
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
+    GrammarRow,
     GrammarStats,
     InvalidGrammarObject,
 )
@@ -42,6 +45,7 @@ from sglang.srt.constrained.json_schema_validation import (
     validate_xgrammar_json_schema,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import is_pin_memory_available
 
@@ -61,6 +65,13 @@ from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
 
 logger = logging.getLogger(__name__)
 MAX_ROLLBACK_TOKENS = 200
+
+
+@lru_cache(maxsize=1)
+def _batch_matcher() -> Optional[BatchGrammarMatcher]:
+    # Built on first use, in the scheduler process; it owns a native thread pool.
+    num_threads = envs.SGLANG_GRAMMAR_BATCH_FILL_THREADS.get()
+    return BatchGrammarMatcher(num_threads) if num_threads > 1 else None
 
 
 def _allocate_token_bitmask(vocab_size: int, batch_size: int) -> torch.Tensor:
@@ -122,6 +133,23 @@ class XGrammarGrammar(BaseGrammarObject):
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         self.matcher.fill_next_token_bitmask(vocab_mask, idx)
+
+    @staticmethod
+    def fill_vocab_mask_batched(
+        entries: List[GrammarRow], vocab_mask: torch.Tensor
+    ) -> None:
+        """Fill on xgrammar's thread pool when every entry is a plain xgrammar grammar."""
+        batch_matcher = _batch_matcher() if len(entries) > 1 else None
+        if batch_matcher is None or not all(
+            isinstance(entry.grammar, XGrammarGrammar) for entry in entries
+        ):
+            BaseGrammarObject.fill_vocab_mask_batched(entries, vocab_mask)
+            return
+        batch_matcher.batch_fill_next_token_bitmask(
+            [entry.grammar.matcher for entry in entries],
+            vocab_mask,
+            [entry.row for entry in entries],
+        )
 
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
