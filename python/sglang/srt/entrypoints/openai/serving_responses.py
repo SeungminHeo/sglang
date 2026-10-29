@@ -103,7 +103,7 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.reasoning_parser import ReasoningParser, SolarOpen2Detector
 from sglang.srt.parser.response_template import (
     ResponseTemplateReasoningDetector,
     ResponseTemplateToolDetector,
@@ -1093,6 +1093,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         effort = request.reasoning.effort if request.reasoning is not None else None
         if self.reasoning_parser == "hunyuan":
             return effort not in (None, "none", "no_think")
+        if self.reasoning_parser == "solar_open2":
+            return SolarOpen2Detector.thinks(effort)
         if self.template_manager.force_reasoning:
             return True
         config = self.template_manager.reasoning_config

@@ -625,6 +625,10 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
 
     _THINKING_EFFORTS = ("medium", "high", "xhigh")
 
+    @classmethod
+    def thinks(cls, reasoning_effort: object) -> bool:
+        return reasoning_effort is None or reasoning_effort in cls._THINKING_EFFORTS
+
     def __init__(
         self,
         stream_reasoning: bool = True,
@@ -637,9 +641,7 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
         super().__init__(
             "<|think:start|>",
             "<|think:end|>",
-            force_reasoning=(
-                reasoning_effort is None or reasoning_effort in self._THINKING_EFFORTS
-            ),
+            force_reasoning=self.thinks(reasoning_effort),
             stream_reasoning=stream_reasoning,
             # The model sometimes calls a tool before closing its think block.
             tool_start_token="<|tool_call:start|>",

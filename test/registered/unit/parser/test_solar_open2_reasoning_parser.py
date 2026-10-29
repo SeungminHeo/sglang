@@ -1,6 +1,8 @@
 import unittest
+from types import SimpleNamespace
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -62,6 +64,26 @@ class TestSolarOpen2ReasoningParser(CustomTestCase):
             reasoning += r or ""
             content += c or ""
         self.assertEqual((reasoning, content), ("thinking", "answer"))
+
+
+class TestSolarOpen2ServingThinkingMode(CustomTestCase):
+    def test_low_effort_request_applies_grammar_from_first_token(self):
+        """A reasoning_effort=low request carries no think block, so serving_chat
+        must not mark it as reasoning: a response_format grammar deferred to a
+        think end that never comes is never applied (schema-violating JSON)."""
+        serving = object.__new__(OpenAIServingChat)
+        serving.reasoning_parser = "solar_open2"
+        serving.template_manager = SimpleNamespace(
+            reasoning_config=None, force_reasoning=False
+        )
+        for effort, thinking in ((None, True), ("high", True), ("low", False)):
+            with self.subTest(effort=effort):
+                request = ChatCompletionRequest(
+                    model="solar",
+                    messages=[{"role": "user", "content": "hi"}],
+                    reasoning_effort=effort,
+                )
+                self.assertIs(serving._get_reasoning_from_request(request), thinking)
 
 
 if __name__ == "__main__":

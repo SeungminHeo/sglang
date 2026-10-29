@@ -124,6 +124,7 @@ from sglang.srt.parser.python_chat_template import render_chat_segments
 from sglang.srt.parser.reasoning_parser import (
     IQuestQ1ReasoningDetector,
     ReasoningParser,
+    SolarOpen2Detector,
 )
 from sglang.srt.parser.response_template import (
     GRAMMAR_AFTER_REASONING,
@@ -3470,6 +3471,10 @@ class OpenAIServingChat(OpenAIServingBase):
             }
             return
 
+        if self.reasoning_parser == "solar_open2":
+            request.reasoning_effort = "high" if enabled else "none"
+            return
+
         if self.reasoning_parser == "inkling":
             # Effort-conditioned, not toggled: "none" (0.0) is the off switch.
             if not enabled:
@@ -3553,6 +3558,11 @@ class OpenAIServingChat(OpenAIServingBase):
             # "no_think" / "none" / unset; forcing reasoning would route all
             # output into reasoning_content.
             return request.reasoning_effort not in (None, "none", "no_think")
+
+        if self.reasoning_parser == "solar_open2":
+            # The template opens a think block only for these efforts; a grammar
+            # deferred to a think end that never comes would never apply.
+            return SolarOpen2Detector.thinks(request.reasoning_effort)
 
         config = self.template_manager.reasoning_config
         if config is None:
