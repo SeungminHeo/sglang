@@ -1783,6 +1783,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
         """Return whether the fixed Kimi-K3/DSpARK CuTe contract is satisfied."""
         if not self.kernel_dispatcher.verify_backend.is_nv_cutedsl() or not is_cuda():
             return False
+        # The fused kernel sigmoids beta in-kernel and would drop the 2x scale;
+        # the dispatcher path rejects unsupported kernels instead.
+        if layer.allow_neg_eigval:
+            return False
         if importlib.util.find_spec("cutlass") is None:
             return False
         if torch.cuda.get_device_capability()[0] != 10:
