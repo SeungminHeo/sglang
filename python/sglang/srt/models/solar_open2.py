@@ -381,6 +381,7 @@ class SolarOpen2Model(nn.Module):
         super().__init__()
         self.config = config
         self.pp_group = get_parallel().pp_group
+        self.dspark_layers_to_capture: Optional[list[int]] = None
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -434,6 +435,7 @@ class SolarOpen2Model(nn.Module):
             dtype=torch.float32,
             device=hidden_states.device,
         )
+        aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 hidden_states = self.layers[i](
@@ -442,12 +444,22 @@ class SolarOpen2Model(nn.Module):
                     forward_batch=forward_batch,
                     zero_allocator=zero_allocator,
                 )
+            if (
+                self.dspark_layers_to_capture is not None
+                and i in self.dspark_layers_to_capture
+            ):
+                # The residual stream after layer i (pre-norm for the last layer).
+                aux_hidden_states.append(
+                    residual_batch.snapshot(hidden_states, forward_batch)
+                )
 
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
         hidden_states = residual_batch.final_norm(
             hidden_states, forward_batch, self.norm, skip_empty=True
         )
+        if self.dspark_layers_to_capture is not None:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
 
@@ -487,9 +499,21 @@ class SolarOpen2ForCausalLM(nn.Module):
         else:
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config=config)
+        self.capture_aux_hidden_states = False
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
+
+    def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
+        # DSpark target_layer_ids are raw decoder indices, captured after the layer runs.
+        if self.pp_group.world_size > 1:
+            raise NotImplementedError("DSPARK aux hidden capture requires PP=1.")
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.dspark_layers_to_capture = list(layer_ids)
 
     @torch.no_grad()
     def forward(
@@ -509,8 +533,11 @@ class SolarOpen2ForCausalLM(nn.Module):
         )
         if not self.pp_group.is_last_rank:
             return hidden_states
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
 
     def _is_non_local_pp_weight(self, name: str) -> bool:
