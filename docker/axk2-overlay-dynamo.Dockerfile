@@ -36,7 +36,9 @@ assert all(importlib.util.find_spec(m) for m in ('dynamo.sglang', 'dynamo.fronte
 print('ai-dynamo', md.version('ai-dynamo'), 'sglang', md.version('sglang'), 'nixl', md.version('nixl-cu13'))"
 
 # Dynamo 1.6.1's SGLang chat processor ignores Solar Open 2's reasoning_effort
-# (effort low/none answers land in reasoning_content); see the script.
+# (effort low/none answers land in reasoning_content), surfaces tool calls from
+# output cut short by length, and drops the reasoning of a guided tool call that
+# arrives in one chunk; see the script.
 COPY patches/dynamo-sglang-frontend.py /tmp/dynamo-sglang-frontend.py
 RUN python3 /tmp/dynamo-sglang-frontend.py && rm /tmp/dynamo-sglang-frontend.py
 

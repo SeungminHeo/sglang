@@ -9,8 +9,18 @@ decoding waits for the think block to close.
 
 This mirrors the native SGLang server: the effort the frontend renders into the
 prompt (request field first, then chat_template_kwargs, as in
-_render_prompt_token_ids) decides thinking, and reaches the detector. Other parsers
-are untouched. Applied at image build time; fails if the anchors moved.
+_render_prompt_token_ids) decides thinking, and reaches the detector.
+
+Two post-processor fixes ride along:
+- Output cut short (finish_reason length/abort/error) never becomes executable
+  Solar Open 2 tool calls. Calls are emitted at finish from a re-parse, so a
+  truncated `required` JSON array or a second native call cut mid-way would
+  otherwise still surface the calls completed before the cut.
+- A guided (`required`/named) response that thinks first and arrives in one
+  engine chunk kept no reasoning_content: the JSON-array shortcut handed the
+  whole buffer, reasoning included, to the tool parser.
+
+Applied at image build time; fails if the anchors moved.
 """
 import pathlib
 import sys
@@ -76,6 +86,42 @@ IMPORT_PATCH = (
     ")\n"
 )
 
+SHORTCUT_ANCHOR = """        self._pending_guided_reasoning_parts = None
+        if finish_reason and _try_parse_json_array(buffered) is not None:
+            return None, buffered
+"""
+SHORTCUT_PATCH = """        self._pending_guided_reasoning_parts = None
+        # A closed think block ahead of the array goes through the reasoning parser.
+        think_end = getattr(detector, "think_end_token", "")
+        if (
+            finish_reason
+            and not (think_end and think_end in buffered)
+            and _try_parse_json_array(buffered) is not None
+        ):
+            return None, buffered
+"""
+
+EMIT_ANCHOR = """        if finish_reason and self._tool_call_names:
+            tool_calls_out: list[dict[str, Any]] = []
+"""
+EMIT_PATCH = """        if (
+            finish_reason not in (None, "stop")
+            and self._tool_call_names
+            and self._tool_call_parser_name == "solar_open2"
+        ):
+            # Output cut short is not an executable call, even where the
+            # calls before the cut parsed.
+            logger.warning(
+                "Dropping Solar Open 2 tool calls from output finished by %r: %s",
+                finish_reason,
+                sorted(self._tool_call_names.values()),
+            )
+            self._tool_call_names.clear()
+            self._tool_call_ids.clear()
+            self._tool_call_args.clear()
+
+""" + EMIT_ANCHOR
+
 if "_solar_open2_effort" in src:
     sys.exit(f"{path} is already patched")
 for anchor, patch in (
@@ -83,6 +129,8 @@ for anchor, patch in (
     ("\n\ndef resolve_request_force_reasoning(", EFFORT_HELPER),
     (RESOLVE_ANCHOR, RESOLVE_PATCH),
     (PARSER_ANCHOR, PARSER_PATCH),
+    (SHORTCUT_ANCHOR, SHORTCUT_PATCH),
+    (EMIT_ANCHOR, EMIT_PATCH),
 ):
     assert src.count(anchor) == 1, f"anchor not unique in {path}: {anchor[:60]!r}"
     src = src.replace(anchor, patch)
