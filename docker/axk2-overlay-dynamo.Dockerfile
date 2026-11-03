@@ -42,6 +42,11 @@ print('ai-dynamo', md.version('ai-dynamo'), 'sglang', md.version('sglang'), 'nix
 COPY patches/dynamo-sglang-frontend.py /tmp/dynamo-sglang-frontend.py
 RUN python3 /tmp/dynamo-sglang-frontend.py && rm /tmp/dynamo-sglang-frontend.py
 
+# The same chat processor never reports usage.completion_tokens_details.reasoning_tokens;
+# count them from the generated ids; see the script.
+COPY patches/dynamo-sglang-usage.py /tmp/dynamo-sglang-usage.py
+RUN python3 /tmp/dynamo-sglang-usage.py && rm /tmp/dynamo-sglang-usage.py
+
 # The Dynamo operator passes full commands
 # (`python3 -m dynamo.sglang ...`, `python3 -m dynamo.frontend ...`).
 ENTRYPOINT []
