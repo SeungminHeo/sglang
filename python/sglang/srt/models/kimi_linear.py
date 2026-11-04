@@ -53,7 +53,7 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAtten
 from sglang.srt.models.llama import LlamaMLP as KimiMLP
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.runtime_context import get_parallel, get_stream
-from sglang.srt.utils import is_xpu, make_pp_layers
+from sglang.srt.utils import is_cuda, is_xpu, make_pp_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
 
 
@@ -449,6 +449,45 @@ class KimiDeltaAttention(nn.Module):
             lower_bound=self.lower_bound,
             allow_neg_eigval=self.allow_neg_eigval,
         )
+        self._kda_fused_decode_ready = False
+
+    def _prepare_fused_decode(self) -> None:
+        """Prepare immutable fused-decode inputs after checkpoint loading."""
+        from sglang.kernels.ops.attention.kda_fused_decode import _SUPPORTED_HEADS
+
+        if not is_cuda():
+            return
+        layer = self.attn
+        w = layer.conv_weights
+        heads = self.local_num_heads
+        seg = heads * 128
+        if (
+            heads not in _SUPPORTED_HEADS
+            or self.head_k_dim != 128
+            or self.head_v_dim != 128
+            or w is None
+            or not w.is_cuda
+            or torch.cuda.get_device_capability(w.device)[0] < 9
+            or w.shape != (3 * seg, 4)
+            or w.dtype != torch.float32
+            or layer.A_log.dtype != torch.float32
+            or layer.dt_bias.dtype != torch.float32
+        ):
+            return
+        wt = w.detach().t().contiguous()
+        bias = layer.bias
+        layer._k3_fused_decode_args = (
+            wt[:, :seg].contiguous(),
+            wt[:, seg : 2 * seg].contiguous(),
+            wt[:, 2 * seg :].contiguous(),
+            bias.detach().float().contiguous()
+            if bias is not None
+            else torch.zeros(3 * seg, device=w.device, dtype=torch.float32),
+            layer.A_log.detach().reshape(-1),
+            self.o_norm.weight.detach().float().contiguous(),
+            float(self.o_norm.eps),
+        )
+        self._kda_fused_decode_ready = True
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -528,6 +567,12 @@ class KimiDeltaAttention(nn.Module):
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
+        fused_onorm = (
+            self._kda_fused_decode_ready and forward_batch.forward_mode.is_decode()
+        )
+        if fused_onorm:
+            self.attn._k3_onorm_gate = g_proj_states
+            self.attn._k3_onorm_consumed = False
         core_attn_out = self.attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
@@ -535,10 +580,14 @@ class KimiDeltaAttention(nn.Module):
             b=beta,
         )
 
-        norm_gate = g_proj_states.unflatten(
-            -1, (-1, self.head_dim)
-        )  # ... (h d) -> ... h d
-        core_attn_out = self.o_norm(core_attn_out, norm_gate)
+        if fused_onorm:
+            self.attn._k3_onorm_gate = None
+            fused_onorm = self.attn._k3_onorm_consumed
+        if not fused_onorm:
+            norm_gate = g_proj_states.unflatten(
+                -1, (-1, self.head_dim)
+            )  # ... (h d) -> ... h d
+            core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)  # 1 n h d -> n (h d)
 
         return self.o_proj(core_attn_out)[0]

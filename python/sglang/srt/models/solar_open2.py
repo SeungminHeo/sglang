@@ -648,5 +648,14 @@ class SolarOpen2ForCausalLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight, **kwargs)
 
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_OPT_FUSED_KDA_DECODE.get():
+            for layer in self.model.layers:
+                if isinstance(layer, SolarOpen2DecoderLayer) and isinstance(
+                    layer.self_attn, KimiDeltaAttention
+                ):
+                    layer.self_attn._prepare_fused_decode()
+
 
 EntryClass = SolarOpen2ForCausalLM
