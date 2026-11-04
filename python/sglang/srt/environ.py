@@ -1603,6 +1603,8 @@ class Envs:
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
     SGLANG_OPT_FLASHINFER_VERIFY_HOST_PLAN = EnvBool(False)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
+    # Solar: fuse conv, beta-scaled KDA decode, and output RMSNorm.
+    SGLANG_OPT_FUSED_KDA_DECODE = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)

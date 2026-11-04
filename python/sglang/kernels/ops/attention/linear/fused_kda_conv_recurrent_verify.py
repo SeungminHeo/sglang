@@ -111,6 +111,7 @@ def fused_kda_conv_gating_verify_kernel(
     SAVE_INTERMEDIATE_WINDOW: tl.constexpr,
     CACHE_INTERMEDIATE_STATES: tl.constexpr,
     ROUND_CONV_PRODUCTS: tl.constexpr,
+    ALLOW_NEG_EIGVAL: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
     # ReplaySSM fused ring-write (spec verify): per-slot rings consumed by the
     # commit-time exact fold (kda_replayssm_spec_decode.py). Off -> dead code.
@@ -329,6 +330,8 @@ def fused_kda_conv_gating_verify_kernel(
             b_g = -tl.exp(b_A_log) * softplus_x
 
         b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+        if ALLOW_NEG_EIGVAL:
+            b_beta *= 2.0
 
         # ReplaySSM ring-write. Must sit here: b_k still pre-l2norm, b_v still
         # pre-delta, b_g/b_beta formed -- so the commit fold's replay is
@@ -455,6 +458,7 @@ def fused_kda_conv_gating_verify(
     replayssm_rawk: Optional[torch.Tensor] = None,
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
+    allow_neg_eigval: bool = False,
 ) -> torch.Tensor:
     """Chain-verify fast path. Returns ``o`` of shape [1, seq_len, HV, V],
     matching the unfused ``target_verify`` output layout."""
@@ -486,7 +490,14 @@ def fused_kda_conv_gating_verify(
     # BV=128 (the norm-fusion single-tile probe) measured 2x slower -- folding
     # the gated RMSNorm into this kernel's epilogue is a dead end; it is
     # PDL-chained behind this kernel instead (see fused_norm_gate.py).
-    BV = min(triton.next_power_of_2(V), KDA_VERIFY_BLOCK_V)
+    # Solar has more heads per rank than K3. Wider V tiles avoid duplicated
+    # Q/K convolution work at larger grids. B200/H200 sweeps use T=6; the
+    # backend retains the split chain above 128 batch*head pairs.
+    block_v = KDA_VERIFY_BLOCK_V
+    if allow_neg_eigval and not is_hip_runtime():
+        pairs = B * HV
+        block_v = 8 if pairs <= 32 else 16 if pairs <= 64 else 32
+    BV = min(triton.next_power_of_2(V), block_v)
     if (
         is_hip_runtime()
         and num_warps == 1
@@ -612,6 +623,7 @@ def fused_kda_conv_gating_verify(
         SAVE_INTERMEDIATE_WINDOW=intermediate_conv_window is not None,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         ROUND_CONV_PRODUCTS=is_hip_runtime() and conv_weight.dtype == torch.float32,
+        ALLOW_NEG_EIGVAL=allow_neg_eigval,
         replayssm_rawv=replayssm_rawv,
         replayssm_rawk=replayssm_rawk,
         replayssm_g=replayssm_g,

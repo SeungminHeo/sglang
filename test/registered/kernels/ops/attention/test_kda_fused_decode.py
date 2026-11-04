@@ -1,12 +1,13 @@
-"""Kimi-K3 fused KDA decode must match the existing unfused decode chain.
+"""Kimi-K3 and Solar fused KDA decode must match the existing unfused decode chain.
 
 The fused kernel replaces:
 
     causal_conv1d_update -> kda_packed_decode -> sigmoid-gated RMSNorm
 
 This file covers the local head layouts used by Kimi-K3 TP8/TP16/TP32:
-H = 12/6/3. The H=6 and H=3 cases are the branches added by the fixed-head
-dispatch in ``kda_fused_decode.cuh``.
+H = 12/6/3, plus Solar TP2/4/8 (H=32/16/8, beta in (0, 2)).
+Solar cases cover repeated updates, saturated beta, padded requests, and
+noncontiguous SSM pool slots.
 """
 
 import pytest
@@ -20,7 +21,7 @@ from sglang.kernels.ops.attention.fla.fused_recurrent import (
 from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=8, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 _HEAD_DIM = 128
 _CONV_STATE_W = 3
@@ -86,6 +87,7 @@ def _run_unfused_reference(
     a_log,
     dt_bias,
     onorm_weight,
+    allow_neg_eigval=False,
 ):
     heads = ssm_states.shape[-3]
     qkv = causal_conv1d_update(
@@ -110,6 +112,7 @@ def _run_unfused_reference(
         out,
         cache_indices,
         use_qk_l2norm_in_kernel=True,
+        allow_neg_eigval=allow_neg_eigval,
     )
     ref = rms_norm_gated(
         out,
@@ -124,14 +127,19 @@ def _run_unfused_reference(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
-    "heads,tp_size",
+    "heads,tp_size,allow_neg_eigval",
     [
-        pytest.param(3, 32, id="tp32_h3"),
-        pytest.param(6, 16, id="tp16_h6"),
-        pytest.param(12, 8, id="tp8_h12"),
+        pytest.param(3, 32, False, id="tp32_h3"),
+        pytest.param(6, 16, False, id="tp16_h6"),
+        pytest.param(12, 8, False, id="tp8_h12"),
+        pytest.param(8, 8, True, id="solar_tp8_h8"),
+        pytest.param(16, 4, True, id="solar_tp4_h16"),
+        pytest.param(32, 2, True, id="solar_tp2_h32"),
     ],
 )
-def test_kda_fused_decode_matches_unfused_chain(heads: int, tp_size: int):
+def test_kda_fused_decode_matches_unfused_chain(
+    heads: int, tp_size: int, allow_neg_eigval: bool
+):
     (
         mixed_qkv,
         a,
@@ -149,8 +157,18 @@ def test_kda_fused_decode_matches_unfused_chain(heads: int, tp_size: int):
 
     conv_ref = conv_states.clone()
     conv_fused = conv_states.clone()
-    state_ref = ssm_states.clone()
-    state_fused = ssm_states.clone()
+    if allow_neg_eigval:
+        cache_indices = torch.tensor([3, 1, 5, -1], device="cuda", dtype=torch.int32)
+        # Unified pools may interleave layers between adjacent state slots.
+        state_ref = torch.empty((_SLOTS, 2, heads, 128, 128), device="cuda")[:, 0]
+        state_ref.copy_(ssm_states)
+        state_fused = torch.empty_strided(
+            state_ref.shape, state_ref.stride(), device="cuda"
+        )
+        state_fused.copy_(ssm_states)
+    else:
+        state_ref = ssm_states.clone()
+        state_fused = ssm_states.clone()
 
     w_q_t, w_k_t, w_v_t = [
         weight.t().contiguous()
@@ -167,46 +185,60 @@ def test_kda_fused_decode_matches_unfused_chain(heads: int, tp_size: int):
         onorm_g,
     )
 
-    ref = _run_unfused_reference(
-        mixed_qkv.clone(),
-        a,
-        b,
-        onorm_g,
-        conv_ref,
-        state_ref,
-        cache_indices,
-        conv_weights,
-        conv_bias,
-        a_log,
-        dt_bias,
-        onorm_weight,
-    )
-    fused = kda_fused_decode.kda_fused_decode(
-        mixed_qkv.clone(),
-        a,
-        b,
-        conv_fused,
-        w_q_t,
-        w_k_t,
-        w_v_t,
-        conv_bias,
-        a_log,
-        dt_bias,
-        onorm_g,
-        onorm_weight,
-        state_fused,
-        cache_indices,
-        scale=_HEAD_DIM**-0.5,
-        onorm_eps=1e-6,
-    )
-    torch.cuda.synchronize()
+    for step in range(8 if allow_neg_eigval else 1):
+        if allow_neg_eigval:
+            b.fill_(8.0 if step % 2 else -8.0)
+            a.fill_((-24.0, -12.0, -2.0, 0.0, 2.0, 12.0, 20.0, 24.0)[step])
+        ref = _run_unfused_reference(
+            mixed_qkv.clone(),
+            a,
+            b,
+            onorm_g,
+            conv_ref,
+            state_ref,
+            cache_indices,
+            conv_weights,
+            conv_bias,
+            a_log,
+            dt_bias,
+            onorm_weight,
+            allow_neg_eigval=allow_neg_eigval,
+        )
+        fused = kda_fused_decode.kda_fused_decode(
+            mixed_qkv.clone(),
+            a,
+            b,
+            conv_fused,
+            w_q_t,
+            w_k_t,
+            w_v_t,
+            conv_bias,
+            a_log,
+            dt_bias,
+            onorm_g,
+            onorm_weight,
+            state_fused,
+            cache_indices,
+            scale=_HEAD_DIM**-0.5,
+            onorm_eps=1e-6,
+            allow_neg_eigval=allow_neg_eigval,
+        )
+        torch.cuda.synchronize()
 
-    # JIT log breadcrumb for PR/CI evidence that the fused fixed-head branch ran.
-    print(f"K3 fused KDA decode test used fused path: TP{tp_size}, H={heads}")
-
-    torch.testing.assert_close(fused, ref, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(state_fused, state_ref, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(conv_fused, conv_ref, rtol=0, atol=0)
+        valid = cache_indices >= 0
+        if allow_neg_eigval:
+            torch.testing.assert_close(
+                fused[:, valid],
+                ref[:, valid],
+                rtol=torch.finfo(torch.bfloat16).eps,
+                atol=1e-5,
+            )
+            torch.testing.assert_close(state_fused, state_ref, rtol=1e-5, atol=2e-6)
+            assert torch.count_nonzero(fused[:, ~valid]) == 0
+        else:
+            torch.testing.assert_close(fused, ref, rtol=2e-2, atol=2e-2)
+            torch.testing.assert_close(state_fused, state_ref, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(conv_fused, conv_ref, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

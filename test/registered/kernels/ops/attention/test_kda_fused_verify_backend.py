@@ -59,6 +59,7 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
                 A_log=randn(v_heads, dtype=torch.float32),
                 dt_bias=randn(v_heads * head_dim, dtype=torch.float32),
                 lower_bound=lower_bound,
+                allow_neg_eigval=False,
             )
             for i in range(num_layers)
         ]
@@ -152,6 +153,7 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
             slots.numel(), device="cuda", dtype=torch.int32
         )
         backend.accept_lens_pool = None
+        backend._fused_chain_verify_logged = False
         backend.kernel_dispatcher = KDAKernelDispatcher(
             LinearAttnKernelBackend.TRITON,
             LinearAttnKernelBackend.TRITON,
@@ -189,6 +191,7 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
                     heads=heads,
                     v_heads=v_heads,
                     lower_bound=lower_bound,
+                    allow_neg_eigval=False,
                     num_accept_tokens=num_accept_tokens,
                 ),
                 override_platform(**platform),
@@ -297,6 +300,55 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
                 ):
                     torch.testing.assert_close(
                         getattr(state, name), getattr(ref_state, name), rtol=0, atol=0
+                    )
+
+    def test_solar_snapshot_dispatch_and_states(self):
+        # B*H <= 128 uses fusion; larger grids and ReplaySSM keep the reference.
+        for batch_size, ring, expected_calls in (
+            (4, False, 2),
+            (17, False, 0),
+            (1, True, 0),
+        ):
+            with self.subTest(batch_size=batch_size, ring=ring):
+                layers, initial, slots, batch, rounds = self._make_case(
+                    batch_size=batch_size, heads=8, v_heads=8, lower_bound=None
+                )
+                for layer in layers:
+                    layer.allow_neg_eigval = True
+                    layer.conv_weights = layer.conv_weights.float()
+                    layer.bias = layer.bias.float()
+                backend, _, state = self._make_backend(
+                    initial, slots, 4, fused=True, ring=ring
+                )
+                reference, _, ref_state = self._make_backend(
+                    initial, slots, 4, fused=False, ring=ring
+                )
+                out = self._verify(backend, layers, batch, rounds[0])
+                ref = self._verify(reference, layers, batch, rounds[0])
+                self.assertEqual(
+                    backend._fused_chain_verify_fn.call_count, expected_calls
+                )
+                for actual, expected in zip(out, ref):
+                    torch.testing.assert_close(actual, expected, **_OUTPUT_TOL)
+                torch.testing.assert_close(
+                    state.temporal, initial.temporal, rtol=0, atol=0
+                )
+                if expected_calls:
+                    torch.testing.assert_close(
+                        state.conv[0], initial.conv[0], rtol=0, atol=0
+                    )
+                torch.testing.assert_close(
+                    state.intermediate_conv_window[0],
+                    ref_state.intermediate_conv_window[0],
+                    rtol=0,
+                    atol=0,
+                )
+                if not ring:
+                    torch.testing.assert_close(
+                        state.intermediate_ssm,
+                        ref_state.intermediate_ssm,
+                        atol=2e-6,
+                        rtol=0,
                     )
 
     def test_snapshot_dispatch_is_unchanged(self):
