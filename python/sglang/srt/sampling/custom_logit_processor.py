@@ -45,6 +45,13 @@ class CustomLogitProcessor(ABC):
     @classmethod
     def from_str(cls, json_str: str):
         """Deserialize a callable function from a JSON string."""
+        from sglang.srt.sampling.solar_open2 import (
+            SOLAR_PROCESSOR_PREFIX,
+            SolarOpen2TemplateLogitProcessor,
+        )
+
+        if json_str.startswith(SOLAR_PROCESSOR_PREFIX):
+            return SolarOpen2TemplateLogitProcessor.deserialize(json_str)
         return _cache_from_str(json_str)()
 
 
@@ -231,3 +238,24 @@ class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
             logits[batch_idx, indices] = -float("inf")
 
         return logits
+
+
+def should_delay_sampling(
+    *, enable_overlap, enable_spec, sampling_info, is_prefill_only, force_delay
+):
+    """Sample only after previous output_ids/grammar updates are committed.
+
+    PD prefill generates a first token and is not is_prefill_only (the latter
+    means max_new_tokens=0). Preserve the existing grammar-only behavior there.
+    """
+    return (
+        enable_overlap
+        and not enable_spec
+        and (
+            sampling_info.grammars is not None
+            or (
+                not is_prefill_only
+                and (sampling_info.has_custom_logit_processor or force_delay)
+            )
+        )
+    )
