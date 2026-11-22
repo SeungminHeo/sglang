@@ -74,6 +74,15 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Enable users to pass custom logit processors to the server (disabled by default for security)",
     ] = False
+    disable_solar_open2_logits_processor: A[
+        bool,
+        "Disable default template logits processing for SolarOpen2ForCausalLM.",
+    ] = False
+    solar_open2_reasoning_budget: A[
+        Optional[int],
+        "Solar Open2 reasoning-token budget (0 disables the cap). Defaults to "
+        "SGLANG_SOLAR_OPEN2_REASONING_BUDGET, or 131072 when unset.",
+    ] = None
     enable_watermark: A[
         bool,
         "Enable Aaronson-Gumbel text watermarking.",

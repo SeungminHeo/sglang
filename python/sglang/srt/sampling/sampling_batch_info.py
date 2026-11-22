@@ -16,6 +16,7 @@ from sglang.srt.runtime_context import get_exec
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.sampling.solar_open2 import SOLAR_PROCESSOR_PREFIX
 from sglang.srt.sampling.watermarking.core import build_watermark_batch_config
 from sglang.srt.utils.common import is_pin_memory_available
 
@@ -196,10 +197,14 @@ class SamplingBatchInfo:
                 )
 
         # Check if any request has custom logit processor
-        has_custom_logit_processor = (
-            get_exec().features.enable_custom_logit_processor
-            and any(r.custom_logit_processor for r in reqs)  # check the flag first.
-        )  # then check the requests.
+        has_custom_logit_processor = any(
+            r.custom_logit_processor
+            and (
+                get_exec().features.enable_custom_logit_processor
+                or r.custom_logit_processor.startswith(SOLAR_PROCESSOR_PREFIX)
+            )
+            for r in reqs
+        )
         return_sampling_masks = [r.return_sampling_mask for r in reqs]
         return_sampling_support_logprobs = [
             r.return_sampling_mask and r.sampling_logprobs_mode == "support"
@@ -246,7 +251,14 @@ class SamplingBatchInfo:
             # Merge the same type of custom logit processors together
             processor_dict = {}
             for i, r in enumerate(reqs):
-                if r.custom_logit_processor is None:
+                if not r.custom_logit_processor:
+                    continue
+                if not (
+                    get_exec().features.enable_custom_logit_processor
+                    or r.custom_logit_processor.startswith(SOLAR_PROCESSOR_PREFIX)
+                ):
+                    # TokenizerManager rejects client processors when the feature is
+                    # off; never raise inside the scheduler loop for one request.
                     continue
                 processor_str = r.custom_logit_processor
                 if processor_str not in processor_dict:

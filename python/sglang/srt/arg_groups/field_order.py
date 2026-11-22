@@ -489,6 +489,8 @@ POSITIONAL_FIELD_ORDER = (
     "enable_weights_cpu_backup",
     "enable_draft_weights_cpu_backup",
     "enable_custom_logit_processor",
+    "disable_solar_open2_logits_processor",
+    "solar_open2_reasoning_budget",
     "enable_return_hidden_states",
     "return_hidden_states_mode",
     "enable_return_routed_experts",

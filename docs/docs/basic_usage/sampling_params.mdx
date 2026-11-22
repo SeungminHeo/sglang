@@ -502,6 +502,79 @@ print(response.json())
 
 Detailed example in [structured outputs](../advanced_features/structured_outputs).
 
+### Solar Open2 template processor
+
+For models whose architecture is `SolarOpen2ForCausalLM`, the server attaches
+`SolarOpen2TemplateLogitProcessor` to generation requests by default. This built-in
+does not require `--enable-custom-logit-processor` and does not deserialize client
+code. It enforces the control-token state machine from
+[Upstage's v0.22.0-solar-open2 processor](https://github.com/UpstageAI/vllm/blob/v0.22.0-solar-open2/vllm/v1/sample/logits_processor/solar_open2.py).
+
+Use `--solar-open2-reasoning-budget 131072` to set the default reasoning-token cap;
+`0` disables the cap while keeping template enforcement. Use
+`--disable-solar-open2-logits-processor` to disable the built-in entirely.
+Token IDs and pure-newline tokens are resolved from tokenizer metadata, with Solar
+Open2 defaults when metadata is unavailable. For parity with the Upstage processor,
+these environment overrides are supported through SGLang's environment registry:
+
+- `SGLANG_SOLAR_OPEN2_TOKEN_IDS`: JSON object keyed by control field or token text.
+- `SGLANG_SOLAR_OPEN2_EOS_TOKEN_IDS`: JSON list of EOS IDs; control sentinels are excluded.
+- `SGLANG_SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS`: JSON list; `[]` disables the leading-newline ban.
+- `SGLANG_SOLAR_OPEN2_REASONING_BUDGET`: non-negative integer; defaults to 131072.
+
+The explicit server budget argument takes precedence over the environment, and
+request `custom_params` takes precedence over the server default. Invalid override
+values fail initialization rather than silently reverting to defaults.
+
+For native `/generate` requests, put overrides inside `sampling_params.custom_params`:
+
+```json
+{
+  "text": "<|im:start|>user<|im:content|>What is 17 * 23?<|im:end|><|im:start|>assistant<|im:content|><|think:start|>",
+  "sampling_params": {
+    "max_new_tokens": 256,
+    "custom_params": {
+      "solar_open2_reasoning_budget": 32,
+      "disable_solar_open2_logits_processor": 0
+    }
+  }
+}
+```
+
+The request budget must be a non-negative integer; `0` removes the cap. A nonzero
+integer disable flag bypasses the processor for that request. If you supply a
+client `custom_logit_processor` while the built-in is active, the request is
+rejected. Disable the built-in for that request and enable
+`--enable-custom-logit-processor` to use client code instead.
+
+During reasoning, the processor blocks invalid control tokens, premature EOS,
+and a pure-newline token immediately after the thinking opener. At the budget it
+forces the thinking terminator. It blocks an empty unstructured answer. For
+`json_schema`, `regex`, `ebnf`, or `structural_tag`, CONTENT-phase logits are left
+to the grammar. Use the Solar reasoning parser to coordinate grammar activation
+with the thinking terminator.
+
+State is stored on each request and updated from newly committed output tokens.
+Overlap sampling waits for the previous batch's output update. PD prefill's first
+generated token also observes the prompt-ending thinking opener; zero-token
+prefill-only requests do not generate a token.
+
+The processor is attached by the Python `TokenizerManager`. The embedded Rust
+server (`SGLANG_RUST_SERVER=1`) bypasses that ingress, so its requests run without
+the processor.
+
+Speculative decoding is unsupported: starting a Solar server with both features
+raises an error. Disable the built-in explicitly to use speculative decoding;
+the sampler also rejects multi-token verification rows for this processor.
+
+A frontend must forward `custom_params` for request overrides to take effect.
+The inspected Dynamo Rust OpenAI preprocessing and SGLang token-based worker path
+do not forward this field; that path uses the server defaults. The tested Dynamo
+1.7.0 frontend rejects OpenAI requests containing `custom_params` with HTTP 400
+(unsupported parameter). When Dynamo's SGLang native `/generate` API is enabled,
+token-input requests do forward `sampling_params.custom_params`; this was also
+verified with PD. No Dynamo frontend code changes are included.
+
 ### Custom logit processor
 
 Launch a server with `--enable-custom-logit-processor` flag on.

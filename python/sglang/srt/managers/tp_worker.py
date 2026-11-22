@@ -59,6 +59,7 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
 )
+from sglang.srt.sampling.custom_logit_processor import should_delay_sampling
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.hf_transformers_utils import (
@@ -725,18 +726,13 @@ class TpModelWorker(BaseTpWorker):
                 # Skip sampling; spec_v2 worker fires its own publish post-verify.
                 return batch_result
 
-            # Delay sampling only for normal generation requests.
-            # Keep the existing grammar behavior unchanged.
-            if (
-                self.enable_overlap
-                and not self.enable_spec
-                and (
-                    forward_batch.sampling_info.grammars is not None
-                    or (
-                        envs.SGLANG_ENABLE_DELAY_SAMPLE.get()
-                        and not forward_batch.is_prefill_only
-                    )
-                )
+            # Stateful processors, like grammars, require committed output_ids.
+            if should_delay_sampling(
+                enable_overlap=self.enable_overlap,
+                enable_spec=self.enable_spec,
+                sampling_info=forward_batch.sampling_info,
+                is_prefill_only=forward_batch.is_prefill_only,
+                force_delay=envs.SGLANG_ENABLE_DELAY_SAMPLE.get(),
             ):
 
                 def sample_batch_func():

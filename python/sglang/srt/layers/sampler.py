@@ -1045,6 +1045,10 @@ def apply_custom_logit_processor(
         else torch.arange(num_tokens_in_batch, device=sampling_batch_info.device)
     )
     for entry in sampling_batch_info.custom_logit_processor.values():
+        if num_tokens_in_batch > 1 and not getattr(
+            entry.processor, "supports_speculative", True
+        ):
+            raise ValueError("Solar Open2 does not support speculative decoding")
         rows, indices = entry.rows, entry.indices
         assert len(rows) == indices.numel(), (
             f"The number of cached processor rows ({len(rows)}) does not match the "

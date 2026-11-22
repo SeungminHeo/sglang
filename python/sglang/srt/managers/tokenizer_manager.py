@@ -168,6 +168,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.custom_logit_processor import supports_sampling_mask
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.solar_open2 import SolarOpen2ProcessorDefaults
 from sglang.srt.sampling.watermarking.core import (
     redact_watermark_command_line,
     redact_watermark_secrets,
@@ -554,6 +555,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Initialize tokenizer and multimodalprocessor
         self.init_tokenizer_and_processor()
+        self.init_solar_open2_processor()
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
@@ -604,6 +606,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.default_priority_value = get_schedule().default_priority_value
         self.num_reserved_tokens = compute_num_reserved_tokens()
         self.validate_total_tokens = True
+
+    def init_solar_open2_processor(self):
+        self.solar_open2_processor = SolarOpen2ProcessorDefaults(
+            model_config=self.model_config,
+            tokenizer=self.tokenizer,
+            model_path=self.model_path,
+            tokenizer_path=get_serving().tokenizer_path,
+            disabled=get_exec().features.disable_solar_open2_logits_processor,
+            reasoning_budget=get_exec().features.solar_open2_reasoning_budget,
+            speculative_algorithm=get_spec().speculative_algorithm,
+        )
 
     def init_tokenizer_and_processor(self):
         server_args = self.server_args
@@ -1605,7 +1618,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 positional_embed_overrides=obj.positional_embed_overrides,
                 session_id=obj.session_id,
                 session_params=session_params,
-                custom_logit_processor=obj.custom_logit_processor,
+                custom_logit_processor=self.solar_open2_processor.for_request(
+                    obj.custom_logit_processor, sampling_params
+                ),
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,
