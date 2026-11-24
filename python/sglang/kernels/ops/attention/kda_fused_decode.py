@@ -11,8 +11,8 @@ Kernel body vendored from the NVIDIA x Moonshot Kimi K3 optimization package
 (see csrc/attention/kda_fused_decode.cuh for provenance and the list of
 integration patches). Specialized for the K3 KDA decode regime:
 K = V = 128, kernel width 4, no lower bound, T = 1 per request.
-The JIT currently instantiates local head counts H = HV in {12, 6, 3}
-(TP8, TP16, and TP32).
+The JIT instantiates local head counts H = HV in {3, 6, 8, 12, 16, 32},
+covering Kimi K3 TP8/16/32 and Solar Open 2 TP2/4/8.
 
 The model must hand off the output-norm gate (attempt-and-verify stash on the
 attention layer, see kimi_k3.py), and a covered() check gates supported inputs.
@@ -35,19 +35,21 @@ from sglang.kernels.jit.utils import (
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-_SUPPORTED_HEADS = {3, 6, 12}
+_SUPPORTED_HEADS = {3, 6, 8, 12, 16, 32}
 _CONV_STATE_W = 3  # kernel width 4 -> 3 cached tokens
 
 
 @cache_once
-def _jit_kda_fused_decode_module() -> Module:
+def _jit_kda_fused_decode_module(allow_neg_eigval: bool = False) -> Module:
     args = make_cpp_args(is_arch_support_pdl())
+    # Solar retains the packed reference's FP32 transcendental functions.
+    # Keep K3's existing fast-math specialization unchanged.
     return load_jit(
-        "kda_fused_decode",
+        "kda_fused_decode_solar" if allow_neg_eigval else "kda_fused_decode",
         *args,
         cuda_files=["attention/kda_fused_decode.cuh"],
         cuda_wrappers=[("run", f"KdaFusedDecodeKernel<{args}>::run")],
-        extra_cuda_cflags=["-O3", "--use_fast_math"],
+        extra_cuda_cflags=["-O3"] + ([] if allow_neg_eigval else ["--use_fast_math"]),
     )
 
 
@@ -127,17 +129,19 @@ def kda_fused_decode(
     scale: float,
     onorm_eps: float,
     lower_bound: Optional[float] = None,
+    allow_neg_eigval: bool = False,
 ) -> torch.Tensor:
     """In-place fused decode step: shifts `conv_states` and updates
     `ssm_states` rows selected by `cache_indices` (rows < 0 are padded
     cuda-graph slots and only zero their output), returns the gated-normed
     attention output [1, B, HV, V] (the packed-decode output layout).
-    Caller must have checked covered()."""
+    Solar mode (allow_neg_eigval) preserves the unfused chain's BF16 conv
+    and pre-norm rounding boundaries. Caller must have checked covered()."""
     B = mixed_qkv.shape[0]
     H = ssm_states.shape[-3]
     seg = H * 128
     out = torch.empty((B, seg), dtype=torch.bfloat16, device=mixed_qkv.device)
-    _jit_kda_fused_decode_module().run(
+    _jit_kda_fused_decode_module(allow_neg_eigval).run(
         mixed_qkv,
         a,
         b,
@@ -162,5 +166,7 @@ def kda_fused_decode(
         float(onorm_eps),
         float(lower_bound) if lower_bound is not None else 0.0,
         lower_bound is not None,
+        2.0 if allow_neg_eigval else 1.0,
+        allow_neg_eigval,
     )
     return out.view(1, B, H, 128)

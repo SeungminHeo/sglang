@@ -542,11 +542,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
         # One-shot; emitted at the first fused-decode interception below.
         self._fused_override_notice = (
-            "K3 fused KDA decode engaged: --linear-attn-decode-backend "
+            "Fused KDA decode engaged: --linear-attn-decode-backend "
             f"{decode_backend} only picks the fallback kernel for shapes "
             "the fused kernel does not cover."
         )
         self._fused_chain_verify_fn = None
+        self._fused_chain_verify_logged = False
         if (
             envs.SGLANG_OPT_FUSED_KDA_VERIFY.get()
             and verify_backend.is_triton()
@@ -947,6 +948,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     scale=layer.head_k_dim**-0.5,
                     onorm_eps=onorm_eps,
                     lower_bound=layer.lower_bound,
+                    allow_neg_eigval=layer.allow_neg_eigval,
                 )
                 layer._k3_onorm_consumed = True
                 self._track_mamba_state_decode(
@@ -1388,6 +1390,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_g=replayssm_g,
                 replayssm_beta=replayssm_beta,
             ):
+                if not self._fused_chain_verify_logged:
+                    rank0_log(
+                        "Fused KDA chain verify engaged: "
+                        f"batch={batch_size}, heads={layer.num_v_heads}, "
+                        f"steps={draft_token_num}, beta_scale={2 if layer.allow_neg_eigval else 1}"
+                    )
+                    self._fused_chain_verify_logged = True
                 return self._fused_chain_verify_fn(
                     mixed_qkv=mixed_qkv,
                     conv_weight=layer.conv_weights,
@@ -1417,6 +1426,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     head_k_dim=layer.head_k_dim,
                     head_v_dim=layer.head_v_dim,
                     lower_bound=layer.lower_bound,
+                    allow_neg_eigval=layer.allow_neg_eigval,
                     **ring_kwargs,
                 )
             dense_token_indices = None
@@ -1542,7 +1552,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
     ) -> bool:
         if self._fused_chain_verify_fn is None or not mixed_qkv.is_cuda:
             return False
-        if layer.allow_neg_eigval:
+        if layer.allow_neg_eigval and (replayssm_rawv is not None or is_hip()):
+            # Solar ReplaySSM and ROCm fusion have not been validated.
             return False
         if any(
             value is not None
@@ -1572,6 +1583,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         seq_len, dim = mixed_qkv.shape
         batch_size = seq_len // draft_token_num
+        if layer.allow_neg_eigval and (
+            batch_size * layer.num_v_heads > 128 or draft_token_num > 8
+        ):
+            # Larger grids/long chains favor the split kernels' throughput.
+            return False
         if replayssm_on and (
             batch_size != 1 or not (get_platform().is_sm90 or get_platform().is_sm100)
         ):

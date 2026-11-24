@@ -123,7 +123,9 @@ def _make_inputs(
     return inputs
 
 
-def _run_reference(inp, B, T, H, HV, K, V, lower_bound, rings=None):
+def _run_reference(
+    inp, B, T, H, HV, K, V, lower_bound, rings=None, allow_neg_eigval=False
+):
     dim = 2 * H * K + HV * V
     seq_len = B * T
     conv = inp["conv_pool"].clone()
@@ -171,16 +173,20 @@ def _run_reference(inp, B, T, H, HV, K, V, lower_bound, rings=None):
         cache_steps=T,
         retrieve_parent_token=None,
         lower_bound=lower_bound,
+        allow_neg_eigval=allow_neg_eigval,
         cache_ring=rings is not None,
         replayssm_rawv=rings["rawv"] if rings is not None else None,
         replayssm_rawk=rings["rawk"] if rings is not None else None,
         replayssm_g=rings["g"] if rings is not None else None,
         replayssm_beta=rings["beta"] if rings is not None else None,
     )
+    assert torch.equal(ssm, inp["ssm"]), "verify must not commit the SSM state"
     return o, conv, win, ic
 
 
-def _run_fused(inp, B, T, H, HV, K, V, lower_bound, num_warps, rings=None):
+def _run_fused(
+    inp, B, T, H, HV, K, V, lower_bound, num_warps, rings=None, allow_neg_eigval=False
+):
     conv = inp["conv_pool"].clone()
     ssm = inp["ssm"].clone()
     win = inp["win_pool"].clone()
@@ -208,6 +214,7 @@ def _run_fused(inp, B, T, H, HV, K, V, lower_bound, num_warps, rings=None):
         head_k_dim=K,
         head_v_dim=V,
         lower_bound=lower_bound,
+        allow_neg_eigval=allow_neg_eigval,
         **({"num_warps": num_warps} if num_warps is not None else {}),
         cache_ring=rings is not None,
         replayssm_rawv=rings["rawv"] if rings is not None else None,
@@ -215,10 +222,17 @@ def _run_fused(inp, B, T, H, HV, K, V, lower_bound, num_warps, rings=None):
         replayssm_g=rings["g"] if rings is not None else None,
         replayssm_beta=rings["beta"] if rings is not None else None,
     )
+    assert torch.equal(ssm, inp["ssm"]), "verify must not commit the SSM state"
     return o, conv, win, ic
 
 
-def _compare_case(case, num_warps=None, use_ring=False, weight_dtype=torch.bfloat16):
+def _compare_case(
+    case,
+    num_warps=None,
+    use_ring=False,
+    weight_dtype=torch.bfloat16,
+    allow_neg_eigval=False,
+):
     B, T, H, HV, K, V, W, has_bias, lower_bound, neg_slot, seed = case
     inp = _make_inputs(B, T, H, HV, K, V, W, has_bias, neg_slot, seed, weight_dtype)
     if use_ring:
@@ -228,10 +242,29 @@ def _compare_case(case, num_warps=None, use_ring=False, weight_dtype=torch.bfloa
     else:
         rings_ref = rings_fus = None
     o_ref, _, win_ref, ic_ref = _run_reference(
-        inp, B, T, H, HV, K, V, lower_bound, rings=rings_ref
+        inp,
+        B,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        lower_bound,
+        rings=rings_ref,
+        allow_neg_eigval=allow_neg_eigval,
     )
     o_fus, conv_fus, win_fus, ic_fus = _run_fused(
-        inp, B, T, H, HV, K, V, lower_bound, num_warps, rings=rings_fus
+        inp,
+        B,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        lower_bound,
+        num_warps,
+        rings=rings_fus,
+        allow_neg_eigval=allow_neg_eigval,
     )
 
     idx_vals = inp["idx_vals"]
@@ -253,7 +286,10 @@ def _compare_case(case, num_warps=None, use_ring=False, weight_dtype=torch.bfloa
             assert torch.equal(rings_ref[name], rings_fus[name]), name
     else:
         torch.testing.assert_close(
-            ic_ref[valid_rows], ic_fus[valid_rows], atol=4e-3, rtol=0
+            ic_ref[valid_rows],
+            ic_fus[valid_rows],
+            atol=2e-6 if allow_neg_eigval else 4e-3,
+            rtol=0,
         )
 
 
@@ -308,6 +344,29 @@ def test_output_does_not_depend_on_cta_scheduling():
 @pytest.mark.parametrize("case", _RING_CASES)
 def test_replayssm_ring_matches_unfused(case):
     _compare_case(case, num_warps=4, use_ring=True)
+
+
+@pytest.mark.parametrize("steps", [3, 5, 8])
+@pytest.mark.parametrize("lower_bound", [None, -5.0])
+def test_solar_beta_matches_unfused_output_and_rollback_states(steps, lower_bound):
+    _compare_case(
+        (3, steps, 8, 8, 128, 128, 4, False, lower_bound, True, 42),
+        num_warps=4,
+        allow_neg_eigval=True,
+    )
+
+
+@pytest.mark.parametrize("heads", [8, 16, 32])
+def test_solar_verify_many_ctas_share_conv_history(heads):
+    # Multiple V tiles read the same Q/K conv history. A CTA must not roll it
+    # before later waves have loaded it (a single small batch masks this race).
+    for seed in range(3):
+        _compare_case(
+            (32, 6, heads, heads, 128, 128, 4, False, None, True, seed),
+            num_warps=4,
+            allow_neg_eigval=True,
+            weight_dtype=torch.float32,
+        )
 
 
 if __name__ == "__main__":

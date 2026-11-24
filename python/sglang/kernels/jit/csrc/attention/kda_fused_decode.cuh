@@ -1,4 +1,4 @@
-// KDA fused decode step for Kimi K3: causal conv1d update + delta-rule
+// KDA fused decode step for Kimi K3 and Solar Open 2: causal conv1d update + delta-rule
 // recurrence + gated RMSNorm in a single kernel (replaces the three-kernel
 // causal_conv1d_update -> kda_packed_decode -> rms_norm_gated decode chain).
 //
@@ -28,7 +28,9 @@
 //     experiment on chunan/kda (same mbarrier staging, same 3/4-stage
 //     dispatch by grid size);
 //   * PDL (kUsePDL, plumbed like kda_packed_decode): griddepcontrol wait at
-//     kernel entry, launch_dependents at every exit.
+//     kernel entry, launch_dependents at every exit;
+//   * Solar local head counts 8/16/32 and beta=2*sigmoid, preserving BF16
+//     conv and pre-norm materialization boundaries in Solar mode.
 
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.h>   // For RuntimeCheck
@@ -424,6 +426,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
     float lower_bound,                // linear_attn_config.gate_lower_bound (-5.0 for K3) when kUseLowerBound
     float scale,                      // query scale applied after L2-normalization
     float onorm_eps,                  // onorm RMSNorm epsilon
+    float beta_scale,                 // 2 for Solar's beta in (0, 2), otherwise 1
+    bool round_intermediates,         // preserve the unfused BF16 conv / pre-norm boundaries
     int64_t x_row_stride,             // element stride between consecutive tokens' rows in x_q/x_k/x_v (>= 3*H*128)
     int64_t g_row_stride,             // element stride between consecutive tokens' rows in g (>= HV*128)
     int64_t beta_row_stride,          // element stride between consecutive tokens' rows in beta (>= HV)
@@ -527,7 +531,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       const int hk = hk_off + k;
       const int64_t cs_base = slot * cs_slot_stride + hk;
       const int64_t xq_idx = bos * x_row_stride + hk;
-      const float exp_a = __shfl_sync(0xffffffffu, lane == 0 ? __expf(a_log[i_h]) : 0.0f, 0);
+      const float exp_a =
+          __shfl_sync(0xffffffffu, lane == 0 ? (round_intermediates ? expf(a_log[i_h]) : __expf(a_log[i_h])) : 0.0f, 0);
 
       float q_acc = bias_q[hk];
       float k_acc = bias_k[hk];
@@ -563,9 +568,18 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 
       s_q[k] = device::math::silu_fast(q_acc);
       s_k[k] = device::math::silu_fast(k_acc);
+      if (round_intermediates) {
+        s_q[k] = __bfloat162float(__float2bfloat16(s_q[k]));
+        s_k[k] = __bfloat162float(__float2bfloat16(s_k[k]));
+      }
 
       const float g_raw = bf16_load(g, bos * g_row_stride + i_hv * kDimK + k) + dt_bias[hk];
-      if constexpr (kUseLowerBound) {
+      if (round_intermediates) {
+        // Match packed decode's FP32 gate, including log(1 + exp(x)) rounding.
+        const float gate = kUseLowerBound ? lower_bound / (1.0f + expf(-exp_a * g_raw))
+                                          : -exp_a * (g_raw <= 20.0f ? logf(1.0f + expf(g_raw)) : g_raw);
+        s_decay[k] = expf(gate);
+      } else if constexpr (kUseLowerBound) {
         s_decay[k] = __expf(lower_bound * device::math::sigmoid_fast(exp_a * g_raw));
       } else {
         s_decay[k] = __expf(-exp_a * device::math::softplus_fast(g_raw));
@@ -575,7 +589,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
     if (tid < kDimK) {
       const int k = tid;
       const int hk = hk_off + k;
-      const float exp_a = __shfl_sync(0xffffffffu, lane == 0 ? __expf(a_log[i_h]) : 0.0f, 0);
+      const float exp_a =
+          __shfl_sync(0xffffffffu, lane == 0 ? (round_intermediates ? expf(a_log[i_h]) : __expf(a_log[i_h])) : 0.0f, 0);
 
       float q_acc = bias_q[hk];
       float k_acc = bias_k[hk];
@@ -590,9 +605,18 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 
       s_q[k] = device::math::silu_fast(q_acc);
       s_k[k] = device::math::silu_fast(k_acc);
+      if (round_intermediates) {
+        s_q[k] = __bfloat162float(__float2bfloat16(s_q[k]));
+        s_k[k] = __bfloat162float(__float2bfloat16(s_k[k]));
+      }
 
       const float g_raw = bf16_load(g, bos * g_row_stride + i_hv * kDimK + k) + dt_bias[hk];
-      if constexpr (kUseLowerBound) {
+      if (round_intermediates) {
+        // Match packed decode's FP32 gate, including log(1 + exp(x)) rounding.
+        const float gate = kUseLowerBound ? lower_bound / (1.0f + expf(-exp_a * g_raw))
+                                          : -exp_a * (g_raw <= 20.0f ? logf(1.0f + expf(g_raw)) : g_raw);
+        s_decay[k] = expf(gate);
+      } else if constexpr (kUseLowerBound) {
         s_decay[k] = __expf(lower_bound * device::math::sigmoid_fast(exp_a * g_raw));
       } else {
         s_decay[k] = __expf(-exp_a * device::math::softplus_fast(g_raw));
@@ -626,6 +650,9 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       cs_v[cs_base + cs_w_stride] = v_shift1;
       cs_v[cs_base + 2 * cs_w_stride] = v_new;
       s_v[v] = device::math::silu_fast(v_acc);
+      if (round_intermediates) {
+        s_v[v] = __bfloat162float(__float2bfloat16(s_v[v]));
+      }
 
       if constexpr (kApplyOnorm && kPreloadOnormParams) {
         const int64_t onorm_idx = i_n * onormg_row_stride + i_hv * kDimV + v;
@@ -646,6 +673,9 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       }
       v_acc += bf16_load(x_v, bos * x_row_stride + hvv) * fp32_at(w_v_t, (kKernelWidth - 1) * hvv_dim + hvv);
       s_v[v] = device::math::silu_fast(v_acc);
+      if (round_intermediates) {
+        s_v[v] = __bfloat162float(__float2bfloat16(s_v[v]));
+      }
 
       if constexpr (kApplyOnorm && kPreloadOnormParams) {
         const int64_t onorm_idx = i_n * onormg_row_stride + i_hv * kDimV + v;
@@ -658,7 +688,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
   if (tid == 0) {
     const float beta_raw = bf16_load(beta, bos * beta_row_stride + i_hv);
     if constexpr (kApplyBetaSigmoid) {
-      s_beta = device::math::sigmoid_fast(beta_raw);
+      s_beta = round_intermediates ? beta_scale / (1.0f + expf(-beta_raw))
+                                   : beta_scale * device::math::sigmoid_fast(beta_raw);
     } else {
       s_beta = beta_raw;
     }
@@ -669,19 +700,43 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
     cp_async_state_chunk(s_state, state, slot, i_hv, state_slot_stride, 1);
   }
 
-  const float q_sq = tid < kDimK ? s_q[tid] * s_q[tid] : 0.0f;
-  const float k_sq = tid < kDimK ? s_k[tid] * s_k[tid] : 0.0f;
-  Sum2 qk_sum;
-  if constexpr (kUseActiveQkReduction) {
-    qk_sum = block_reduce_sum2_active_for<kDimK / 32>(q_sq, k_sq, s_reduce);
+  if (round_intermediates) {
+    // Match packed decode's four adjacent K elements per lane, shuffle order,
+    // and (q * inverse_norm) * scale. A different reduction can change BF16
+    // rounding boundaries and accumulate through autoregressive decoding.
+    if (tid < 32) {
+      float q_sq = 0.0f, k_sq = 0.0f;
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const int k = tid * 4 + e;
+        q_sq += s_q[k] * s_q[k];
+        k_sq += s_k[k] * s_k[k];
+      }
+      const float q_inv = 1.0f / sqrtf(device::warp::reduce_sum(q_sq) + 1.0e-6f);
+      const float k_inv = 1.0f / sqrtf(device::warp::reduce_sum(k_sq) + 1.0e-6f);
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const int k = tid * 4 + e;
+        s_q[k] = s_q[k] * q_inv * scale;
+        s_k[k] = s_k[k] * k_inv;
+      }
+    }
+    __syncthreads();
   } else {
-    qk_sum = block_reduce_sum2(q_sq, k_sq, s_reduce);
+    const float q_sq = tid < kDimK ? s_q[tid] * s_q[tid] : 0.0f;
+    const float k_sq = tid < kDimK ? s_k[tid] * s_k[tid] : 0.0f;
+    Sum2 qk_sum;
+    if constexpr (kUseActiveQkReduction) {
+      qk_sum = block_reduce_sum2_active_for<kDimK / 32>(q_sq, k_sq, s_reduce);
+    } else {
+      qk_sum = block_reduce_sum2(q_sq, k_sq, s_reduce);
+    }
+    if (tid < kDimK) {
+      s_q[tid] *= rsqrtf(qk_sum.x + 1.0e-6f) * scale;
+      s_k[tid] *= rsqrtf(qk_sum.y + 1.0e-6f);
+    }
+    __syncthreads();
   }
-  if (tid < kDimK) {
-    s_q[tid] *= rsqrtf(qk_sum.x + 1.0e-6f) * scale;
-    s_k[tid] *= rsqrtf(qk_sum.y + 1.0e-6f);
-  }
-  __syncthreads();
 
   const int k_base = lane * 4;
   const float4 q4 = *reinterpret_cast<const float4*>(s_q + k_base);
@@ -780,8 +835,12 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       if (lane == 0) {
         s_o[v0] = dot_hq.x;
         s_o[v1] = dot_hq.y;
+        if (round_intermediates) {
+          s_o[v0] = __bfloat162float(__float2bfloat16(s_o[v0]));
+          s_o[v1] = __bfloat162float(__float2bfloat16(s_o[v1]));
+        }
         if constexpr (kApplyOnorm && kAccumulateOnormSumsq) {
-          o_sumsq += dot_hq.x * dot_hq.x + dot_hq.y * dot_hq.y;
+          o_sumsq += s_o[v0] * s_o[v0] + s_o[v1] * s_o[v1];
         }
       }
     }
@@ -944,11 +1003,16 @@ struct KdaFusedDecodeKernel {
       double scale,
       double onorm_eps,
       double lower_bound,
-      bool use_lower_bound) {
+      bool use_lower_bound,
+      double beta_scale,
+      bool round_intermediates) {
     using namespace host;
 
     const int64_t kH = A_log.shape()[0];
-    RuntimeCheck(kH == 3 || kH == 6 || kH == 12, "KDA fused decode supports local head counts 3, 6, or 12, got ", kH);
+    RuntimeCheck(
+        kH == 3 || kH == 6 || kH == 8 || kH == 12 || kH == 16 || kH == 32,
+        "KDA fused decode supports local head counts 3, 6, 8, 12, 16, or 32, got ",
+        kH);
     const int64_t kSeg = kH * 128;  // q, k and v segment width
 
     auto B_ = SymbolicSize{"batch"};
@@ -1012,9 +1076,24 @@ struct KdaFusedDecodeKernel {
       // fastest.
       tma_stages = B * static_cast<int>(kH) >= 512 ? 3 : 4;
     }
-    auto kernel = kH == 3 ? select_kda_fused_decode_k3_kernel<3, kUsePDL>(use_lower_bound, tma_stages)
-                          : (kH == 6 ? select_kda_fused_decode_k3_kernel<6, kUsePDL>(use_lower_bound, tma_stages)
-                                     : select_kda_fused_decode_k3_kernel<12, kUsePDL>(use_lower_bound, tma_stages));
+    auto kernel = select_kda_fused_decode_k3_kernel<12, kUsePDL>(use_lower_bound, tma_stages);
+    switch (kH) {
+      case 3:
+        kernel = select_kda_fused_decode_k3_kernel<3, kUsePDL>(use_lower_bound, tma_stages);
+        break;
+      case 6:
+        kernel = select_kda_fused_decode_k3_kernel<6, kUsePDL>(use_lower_bound, tma_stages);
+        break;
+      case 8:
+        kernel = select_kda_fused_decode_k3_kernel<8, kUsePDL>(use_lower_bound, tma_stages);
+        break;
+      case 16:
+        kernel = select_kda_fused_decode_k3_kernel<16, kUsePDL>(use_lower_bound, tma_stages);
+        break;
+      case 32:
+        kernel = select_kda_fused_decode_k3_kernel<32, kUsePDL>(use_lower_bound, tma_stages);
+        break;
+    }
     const int smem_stages = tma_stages == 0 ? 2 : tma_stages;
     const size_t smem_bytes = static_cast<size_t>(smem_stages) * kChunkV * kDimK * sizeof(float);
     host::RuntimeDeviceCheck(
@@ -1051,6 +1130,8 @@ struct KdaFusedDecodeKernel {
             static_cast<float>(lower_bound),
             static_cast<float>(scale),
             static_cast<float>(onorm_eps),
+            static_cast<float>(beta_scale),
+            round_intermediates,
             mixed_qkv.stride(0),
             a.stride(0),
             b.stride(0),
